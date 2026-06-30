@@ -9,13 +9,17 @@ Configured once by an admin — end users just search, no API keys or file uploa
 ## Features
 
 - **Dual AI support** — works with both **ChatGPT (OpenAI, GPT-4o)** and **Gemini (Google, gemini-2.5-flash)**; switch between them with a toggle in the sidebar
-- **D&B database lookup** — pre-loaded by the admin; Turnover, D&B Risk, and Location are auto-populated by matching company name / registration number
+- **Work Package–driven trade selection** — dropdown populated from your real WP list; free-text search box for trades not in the list
+- **Flexible area targeting** — pick a broad UK region, or type a specific town/city/postcode for tighter results
+- **Preferred Supplier prioritisation across multiple clusters** — upload any number of cluster preferred-supplier exports at once (or have the admin commit a folder of them); all are combined, each company tagged with its source cluster, and matches are flagged and sorted to the top when relevant to the chosen trade
+- **D&B database lookup** — pre-loaded by the admin; Turnover and D&B Risk are auto-populated by matching company name / registration number
+- **Turnover-based company sizing** — Company Size band and an estimated Number of Employees are derived automatically from turnover (D&B figure, or an AI-researched estimate when D&B has no record)
+- **Interactive supplier map** — plots suggested suppliers on a UK map; bubble size reflects company turnover, preferred suppliers shown in a different colour
+- **Smart sorting** — results ranked by Turnover → Company Size → Proximity to area, with preferred suppliers always prioritised
 - **Editable results table** — edit any cell before exporting
-- **Export to Excel & CSV**
-- **Proximity scoring** — each company scored 1–10 for how local they are to the target region
-- **Filter & sort** — by D&B Risk, proximity score, or company name
+- **Export to Excel**
 - **Light, high-contrast UI** — readable on any screen
-- **Friendly error messages** — quota/billing issues (HTTP 429), invalid keys, and outdated model names are explained in plain language, with a suggestion to switch providers
+- **Friendly error messages** — quota/billing issues (HTTP 429), temporary overload (503), invalid keys, and outdated model names are explained in plain language
 
 ---
 
@@ -38,22 +42,31 @@ Save. The app reads these automatically; they are never shown to end users.
 
 (For local development, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in the real keys. That file is git-ignored so it won't be committed.)
 
-### Step 2 — Commit the D&B database into the repo
+### Step 2 — Commit the reference files into the repo
 
-Rename your D&B (DNBi) export to exactly **`dnb_database.xlsx`** and place it in the root of the repository, alongside `app.py`:
+Place these in the root of the repository, alongside `app.py`:
 
 ```
 your-repo/
 ├── app.py
 ├── requirements.txt
-├── dnb_database.xlsx   ← your D&B export, committed once
+├── dnb_database.xlsx              ← D&B (DNBi) risk/turnover export
+├── wp_list.xlsx                   ← Work Package list (trade/package descriptions)
+├── preferred_suppliers/           ← folder — add as many cluster files as you like
+│   ├── cluster_1.xlsx
+│   ├── cluster_2.xlsx
+│   └── cluster_3.xlsx
 ├── .gitignore
 └── README.md
 ```
 
-Push to GitHub — Streamlit Cloud redeploys automatically and loads the file at startup.
+Every `.xlsx` file inside `preferred_suppliers/` is loaded and combined automatically — no limit on how many you add. Each company is tagged with which cluster file it came from (shown in the **Preferred Cluster** column in results). To add a new cluster later, just drop another file into that folder and push.
 
-To update the database later, just replace `dnb_database.xlsx` in the repo and push. No code changes needed.
+Push to GitHub — Streamlit Cloud redeploys automatically and loads everything at startup.
+
+None of these files are strictly required for the app to run — any piece the admin hasn't provided yet simply falls back to a manual upload box, shown to whoever is searching, for that session only (the supplier uploader accepts multiple files at once too, so several clusters can be combined on the fly).
+
+To update any of these later, just replace the file(s) in the repo and push. No code changes needed.
 
 ### Verifying setup
 
@@ -113,11 +126,17 @@ Risk values recognised: `low`, `low-moderate`, `moderate`, `high`, `Severe`, `Un
 | Trade Scope | AI-generated scope description |
 | Close to Area | Proximity score (1–10) |
 | Location | Registered / main office address (from D&B where matched) |
-| Contact | Phone and email |
-| Turnover | From D&B database (£) |
+| Turnover | D&B figure where available, otherwise an AI-researched estimate |
+| Turnover Source | "D&B" or "Estimated" |
+| Company Size | Band derived from turnover (Micro / Small / Medium / Large / Major) |
+| Number of Employees | Rough estimate derived from turnover |
 | D&B Risk | Risk rating from D&B |
+| Preferred Supplier | "Yes" if found in any loaded Preferred Supplier list |
+| Preferred Cluster | Which cluster file the preferred match came from |
 | Website | Company website |
-| AI Notes | Additional AI commentary |
+| Notes | Additional commentary |
+
+Results are sorted by **Turnover (desc) → Company Size (desc) → Proximity (desc)**, with preferred suppliers always shown first.
 
 ---
 
@@ -143,6 +162,10 @@ subcontractor-finder/
 ├── app.py                          ← main Streamlit application
 ├── requirements.txt                ← Python dependencies
 ├── dnb_database.xlsx               ← admin-provided D&B export (you add this)
+├── wp_list.xlsx                    ← admin-provided Work Package list (you add this)
+├── preferred_suppliers/            ← admin-provided cluster files (you add these)
+│   ├── cluster_1.xlsx
+│   └── cluster_2.xlsx
 ├── .streamlit/secrets.toml.example ← template for local secrets
 ├── .gitignore
 └── README.md
