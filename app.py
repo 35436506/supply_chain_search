@@ -4,6 +4,7 @@ import json
 import io
 import re
 import os
+import time
 from datetime import datetime
 import requests
 
@@ -297,6 +298,31 @@ def lookup_db(db_df: pd.DataFrame, company_name: str, reg_no: str = "") -> dict:
     }
 
 
+def _post_with_retry(url, headers, body, timeout=60, max_retries=3, backoff_base=2):
+    """POST with retry on transient errors (503 overloaded, 429 with Retry-After,
+    connection resets). Raises the last error if all retries are exhausted."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            if r.status_code in (503, 502, 504):
+                last_exc = requests.HTTPError(response=r)
+                if attempt < max_retries - 1:
+                    time.sleep(backoff_base * (2 ** attempt))
+                    continue
+            r.raise_for_status()
+            return r
+        except requests.HTTPError:
+            raise
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                time.sleep(backoff_base * (2 ** attempt))
+                continue
+    if last_exc:
+        raise last_exc
+
+
 def call_openai(api_key: str, prompt: str) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -307,7 +333,7 @@ def call_openai(api_key: str, prompt: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 2500,
     }
-    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=60)
+    r = _post_with_retry("https://api.openai.com/v1/chat/completions", headers, body)
     r.raise_for_status()
     data = r.json()
     return data["choices"][0]["message"]["content"]
@@ -317,7 +343,7 @@ def call_gemini(api_key: str, prompt: str) -> str:
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, headers=headers, json=body, timeout=60)
+    r = _post_with_retry(url, headers, body)
     r.raise_for_status()
     data = r.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -333,6 +359,11 @@ def call_ai(provider: str, api_key: str, prompt: str) -> str:
 def friendly_api_error(provider: str, e: requests.HTTPError) -> str:
     status = e.response.status_code
     body = e.response.text[:300]
+    if status == 503:
+        other = "ChatGPT" if provider == "Gemini (Google)" else "Gemini"
+        return (f"{provider} is temporarily overloaded (503) — Google/OpenAI's servers are at capacity right now. "
+                f"This usually clears within a minute or two. Try **Find Subcontractors** again, "
+                f"or switch to {other} using the provider toggle while you wait.")
     if status == 429:
         if provider == "ChatGPT (OpenAI)":
             return ("OpenAI quota exceeded (429) — this API key has no remaining credit or hit its rate limit. "
