@@ -121,14 +121,15 @@ st.markdown("""
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "dnb_database.xlsx")
 
 
-def get_admin_api_key() -> str:
-    """Look for an admin-configured OpenAI key in secrets or env vars."""
+def get_admin_api_key(provider: str) -> str:
+    """Look for an admin-configured key in secrets or env vars, per provider."""
+    secret_name = "OPENAI_API_KEY" if provider == "ChatGPT (OpenAI)" else "GEMINI_API_KEY"
     try:
-        if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
+        if secret_name in st.secrets:
+            return st.secrets[secret_name]
     except Exception:
         pass
-    return os.environ.get("OPENAI_API_KEY", "")
+    return os.environ.get(secret_name, "")
 
 
 def get_admin_db_df() -> pd.DataFrame | None:
@@ -312,6 +313,40 @@ def call_openai(api_key: str, prompt: str) -> str:
     return data["choices"][0]["message"]["content"]
 
 
+def call_gemini(api_key: str, prompt: str) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    r = requests.post(url, headers=headers, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def call_ai(provider: str, api_key: str, prompt: str) -> str:
+    if provider == "ChatGPT (OpenAI)":
+        return call_openai(api_key, prompt)
+    else:
+        return call_gemini(api_key, prompt)
+
+
+def friendly_api_error(provider: str, e: requests.HTTPError) -> str:
+    status = e.response.status_code
+    body = e.response.text[:300]
+    if status == 429:
+        if provider == "ChatGPT (OpenAI)":
+            return ("OpenAI quota exceeded (429) — this API key has no remaining credit or hit its rate limit. "
+                    "Check billing at platform.openai.com/account/billing, or switch to Gemini using the provider selector.")
+        else:
+            return ("Gemini quota exceeded (429) — this API key hit its rate or usage limit. "
+                    "Check quota at aistudio.google.com, or switch to ChatGPT using the provider selector.")
+    if status == 401 or status == 403:
+        return f"{provider} rejected this API key ({status}) — it may be invalid, revoked, or missing permissions."
+    if status == 404:
+        return f"{provider} model not found (404) — the model name in the code may be outdated. Details: {body}"
+    return f"{provider} API error ({status}): {body}"
+
+
 def build_ai_prompt(trade: str, region: str, extra_notes: str) -> str:
     return f"""You are a UK construction procurement specialist.
 
@@ -441,8 +476,7 @@ def to_excel_bytes(df: pd.DataFrame, trade: str, region: str) -> bytes:
 # LOAD ADMIN CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 
-admin_api_key = get_admin_api_key()
-admin_db_df   = get_admin_db_df()
+admin_db_df = get_admin_db_df()
 
 # ════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -451,19 +485,25 @@ admin_db_df   = get_admin_db_df()
 with st.sidebar:
     st.markdown("## 🔍 Search")
 
+    ai_provider = st.radio("AI Provider", ["ChatGPT (OpenAI)", "Gemini (Google)"], horizontal=True)
+    admin_api_key = get_admin_api_key(ai_provider)
+
     if admin_api_key and admin_db_df is not None:
         st.success("✅ Ready to search — no setup needed.")
         api_key = admin_api_key
         db_df = admin_db_df
         st.caption(f"D&B database loaded: {len(db_df):,} records")
+    elif admin_api_key and admin_db_df is None:
+        st.warning("⚠️ D&B database not found in repo. Add `dnb_database.xlsx` — see Admin Setup below.")
+        api_key = admin_api_key
+        db_df = None
     else:
-        # Fallback: not yet configured by an admin — show manual setup
-        st.warning("⚠️ Admin setup not detected. Enter details below for this session, or see setup instructions at the bottom of the page.")
-        st.markdown("### API Key")
-        api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...", value=admin_api_key)
-        st.markdown("### D&B Database")
-        db_file = st.file_uploader("D&B Excel export", type=["xlsx", "xls"])
-        db_df = load_excel_any(db_file) if db_file else admin_db_df
+        st.warning(f"⚠️ No admin key configured for {ai_provider}. Enter one below for this session, or see Admin Setup at the bottom of the page.")
+        api_key = st.text_input(f"{ai_provider} API Key", type="password", placeholder="sk-..." if "OpenAI" in ai_provider else "AIza...")
+        db_df = admin_db_df
+        if db_df is None:
+            db_file = st.file_uploader("D&B Excel export (temporary, this session only)", type=["xlsx", "xls"])
+            db_df = load_excel_any(db_file) if db_file else None
 
     st.markdown("---")
     st.markdown("### Trade & Area")
@@ -497,11 +537,12 @@ st.markdown("""
 
 with st.expander("ℹ️ How to use this tool", expanded=False):
     st.markdown("""
-    1. **Select a Trade Package and UK Region** in the sidebar, add any extra notes (minimum turnover, accreditations, etc.).
-    2. Click **Find Subcontractors** — AI researches suitable suppliers and the app cross-references them against the D&B database.
-    3. **Review and edit** the table inline, then **export to Excel or CSV**.
+    1. **Choose an AI provider** (ChatGPT or Gemini) in the sidebar.
+    2. **Select a Trade Package and UK Region**, add any extra notes (minimum turnover, accreditations, etc.).
+    3. Click **Find Subcontractors** — AI researches suitable suppliers and the app cross-references them against the D&B database.
+    4. **Review and edit** the table inline, then **export to Excel or CSV**.
 
-    If you see a setup warning in the sidebar, the admin API key and D&B database haven't been configured yet for this deployment — see **Admin Setup** at the bottom of this page.
+    If you see a setup warning in the sidebar, the admin API key(s) and/or D&B database haven't been configured yet for this deployment — see **Admin Setup** at the bottom of this page.
     """)
 
 if "result_df"   not in st.session_state: st.session_state.result_df   = None
@@ -514,12 +555,12 @@ if search_btn:
     if trade == "— Select —" or region == "— Select —":
         st.warning("Please select both a Trade Package and a UK Region before searching.")
     elif not api_key:
-        st.error("No OpenAI API key available. Ask your admin to configure one, or enter one in the sidebar.")
+        st.error(f"No {ai_provider} API key available. Ask your admin to configure one, or enter one in the sidebar.")
     else:
         with st.spinner(f"Searching for {trade} subcontractors in {region}…"):
             prompt = build_ai_prompt(trade, region, extra)
             try:
-                raw = call_openai(api_key, prompt)
+                raw = call_ai(ai_provider, api_key, prompt)
                 narrative, companies = parse_ai_response(raw)
                 df = companies_to_df(companies, db_df, region)
 
@@ -532,7 +573,7 @@ if search_btn:
                 st.session_state.history.append({"trade": trade, "region": region})
 
             except requests.HTTPError as e:
-                st.error(f"API error ({e.response.status_code}): {e.response.text[:300]}")
+                st.error(friendly_api_error(ai_provider, e))
             except Exception as e:
                 st.error(f"Error: {e}")
 
@@ -644,13 +685,14 @@ else:
 st.markdown("---")
 with st.expander("🛠️ Admin Setup (one-time, do this so users never need to upload anything)", expanded=False):
     st.markdown("""
-    **Step 1 — Add your OpenAI API key as a Streamlit secret**
+    **Step 1 — Add your API keys as Streamlit secrets**
 
     In Streamlit Cloud: open your app → **Settings → Secrets** → paste:
     ```toml
-    OPENAI_API_KEY = "sk-your-key-here"
+    OPENAI_API_KEY = "sk-your-openai-key-here"
+    GEMINI_API_KEY = "AIza-your-gemini-key-here"
     ```
-    Save. The app will pick it up automatically — no user ever sees or enters it.
+    You can add either one or both — the provider selector in the sidebar will show "Ready to search" for whichever key is configured. Save, and the app picks them up automatically; no user ever sees or enters them.
 
     **Step 2 — Commit the D&B database into the GitHub repo**
 
@@ -666,5 +708,7 @@ with st.expander("🛠️ Admin Setup (one-time, do this so users never need to 
 
     To update the database later, just replace `dnb_database.xlsx` in the repo and push — no code changes needed.
 
-    Once both are in place, the sidebar will show **"✅ Ready to search"** and end users will only see the trade/area search boxes.
+    Once both are in place, the sidebar will show **"✅ Ready to search"** and end users will only see the AI provider toggle and the trade/area search boxes.
+
+    **About 429 "quota exceeded" errors:** this means the API key itself has no remaining credit or hit its rate limit — it isn't a bug in the app. Check billing at platform.openai.com (OpenAI) or aistudio.google.com (Gemini), or simply switch providers using the toggle at the top of the sidebar.
     """)
