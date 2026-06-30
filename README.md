@@ -1,17 +1,59 @@
-# 🏗️ Subcontractor Finder
+# 🔍 Subcontractor Finder
 
-AI-powered UK subcontractor discovery tool. Enter a trade package and UK region; Claude or Gemini researches suitable subcontractors and returns a structured, exportable table matched against your D&B database.
+AI-powered UK subcontractor discovery tool. Enter a trade package and UK region; the AI researches suitable subcontractors and returns a structured, exportable table cross-referenced against your D&B (DNBi) database.
+
+Configured once by an admin — end users just search, no API keys or file uploads required.
 
 ---
 
 ## Features
 
-- **Dual AI support** — works with both Anthropic (Claude) and Google (Gemini) APIs
-- **D&B database lookup** — upload your own Excel file; Turnover, C/Line, and D&B Risk columns are auto-populated by matching company name / registration number
+- **AI-powered search** using OpenAI (ChatGPT / GPT-4o)
+- **D&B database lookup** — pre-loaded by the admin; Turnover, D&B Risk, and Location are auto-populated by matching company name / registration number
 - **Editable results table** — edit any cell before exporting
-- **Export to Excel & CSV** — formatted output matching Brighton tab structure
-- **Proximity scoring** — each company is scored 1–10 for how local they are to the target region
+- **Export to Excel & CSV**
+- **Proximity scoring** — each company scored 1–10 for how local they are to the target region
 - **Filter & sort** — by D&B Risk, proximity score, or company name
+- **Light, high-contrast UI** — readable on any screen
+
+---
+
+## One-time Admin Setup
+
+This is the part you do **once**. After this, regular users only see the search boxes — no API key field, no file upload.
+
+### Step 1 — Add your OpenAI API key as a Streamlit secret
+
+In Streamlit Cloud: open your app → **Settings → Secrets** → paste:
+
+```toml
+OPENAI_API_KEY = "sk-your-key-here"
+```
+
+Save. The app reads this automatically; it is never shown to end users.
+
+(For local development, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in the real key. That file is git-ignored so it won't be committed.)
+
+### Step 2 — Commit the D&B database into the repo
+
+Rename your D&B (DNBi) export to exactly **`dnb_database.xlsx`** and place it in the root of the repository, alongside `app.py`:
+
+```
+your-repo/
+├── app.py
+├── requirements.txt
+├── dnb_database.xlsx   ← your D&B export, committed once
+├── .gitignore
+└── README.md
+```
+
+Push to GitHub — Streamlit Cloud redeploys automatically and loads the file at startup.
+
+To update the database later, just replace `dnb_database.xlsx` in the repo and push. No code changes needed.
+
+### Verifying setup
+
+Once both are in place, the app sidebar will show **"✅ Ready to search"**. If either is missing, a warning is shown along with manual fallback fields so the app still works while you finish setup.
 
 ---
 
@@ -26,24 +68,21 @@ streamlit run app.py
 
 ## Deploy to Streamlit Cloud (from GitHub)
 
-1. **Push this folder to a GitHub repo** (e.g. `lor-subcontractor-finder`)
-
+1. Push this folder to a GitHub repo (e.g. `subcontractor-finder`)
 2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
-
 3. Fill in:
-   - **Repository:** `your-github-username/lor-subcontractor-finder`
+   - **Repository:** `your-github-username/subcontractor-finder`
    - **Branch:** `main`
    - **Main file path:** `app.py`
-
-4. Click **Deploy** — that's it. Streamlit Cloud reads `requirements.txt` automatically.
-
-5. Share the generated URL with your procurement team.
+4. Click **Deploy**
+5. Complete the **Admin Setup** steps above (Secrets + `dnb_database.xlsx`)
+6. Share the generated URL with your team
 
 ---
 
 ## D&B (DNBi) Excel File Format
 
-The app is built around the **real DNBi export format**, with these exact columns:
+Built around the real DNBi export format:
 
 | Column | Example |
 |--------|---------|
@@ -59,23 +98,9 @@ Minor naming variations (e.g. "Registration No.", "Turnover", "Risk") are also a
 
 Risk values recognised: `low`, `low-moderate`, `moderate`, `high`, `Severe`, `Undetermined`, `Out of Business`.
 
-## Constructionline (C/Line) Excel File
-
-Constructionline (C/Line) data is **not accessible to the AI** — it isn't a platform Claude or Gemini can query directly. Instead, the app has a **separate uploader** in the sidebar for a C/Line export (e.g. supplier list, membership/accreditation report).
-
-- **No file uploaded:** the C/Line column shows `Not available`
-- **File uploaded, company not found in it:** shows `Not registered`
-- **File uploaded, company found:** shows the membership/status value (e.g. `Gold`, `SSIP Verified`)
-
-Expected columns (auto-detected, names flexible): `Company Name`, `Registration Number`, and a status/level column such as `Status`, `Membership Level`, or `Accreditation Level`.
-
-As soon as you upload a Constructionline export, the table will automatically start populating that column on the next search — no code changes required.
-
 ---
 
 ## Output Table Structure
-
-Matches the **Brighton tab** format from the master Subcontractors Excel:
 
 | Column | Description |
 |--------|-------------|
@@ -83,30 +108,31 @@ Matches the **Brighton tab** format from the master Subcontractors Excel:
 | Registration No. | UK Companies House number |
 | Trade Scope | AI-generated scope description |
 | Close to Area | Proximity score (1–10) |
-| Location | Registered / main office address |
+| Location | Registered / main office address (from D&B where matched) |
 | Contact | Phone and email |
 | Turnover | From D&B database (£) |
-| C/Line | Credit line tier from D&B |
 | D&B Risk | Risk rating from D&B |
 | Website | Company website |
 | AI Notes | Additional AI commentary |
 
 ---
 
-## API Keys
+## API Key
 
-Keys are entered in the sidebar and **never stored** — they exist only for the current browser session.
+Uses an **OpenAI** API key (GPT-4o). Get one at [platform.openai.com](https://platform.openai.com/api-keys).
 
-- **Claude:** Get a key at [console.anthropic.com](https://console.anthropic.com)
-- **Gemini:** Get a key at [aistudio.google.com](https://aistudio.google.com)
+If the admin hasn't configured a key yet, the sidebar shows a manual input field as a temporary fallback (entered keys are session-only, never stored).
 
 ---
 
 ## Folder Structure
 
 ```
-lor-subcontractor-finder/
-├── app.py              ← main Streamlit application
-├── requirements.txt    ← Python dependencies
-└── README.md           ← this file
+subcontractor-finder/
+├── app.py                          ← main Streamlit application
+├── requirements.txt                ← Python dependencies
+├── dnb_database.xlsx               ← admin-provided D&B export (you add this)
+├── .streamlit/secrets.toml.example ← template for local secrets
+├── .gitignore
+└── README.md
 ```

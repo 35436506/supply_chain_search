@@ -3,39 +3,40 @@ import pandas as pd
 import json
 import io
 import re
+import os
 from datetime import datetime
 import requests
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Subcontractor Finder | Laing O'Rourke",
-    page_icon="🏗️",
+    page_title="Subcontractor Finder",
+    page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ── Custom CSS — light background, dark readable text everywhere ─────────────
 st.markdown("""
 <style>
-    /* Sidebar */
-    [data-testid="stSidebar"] { background: #0d1b2a; }
-    [data-testid="stSidebar"] * { color: #e8eaf0 !important; }
-    [data-testid="stSidebar"] .stTextInput label,
-    [data-testid="stSidebar"] .stSelectbox label,
-    [data-testid="stSidebar"] .stFileUploader label { color: #a8b8d0 !important; font-size:0.8rem; }
-    [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #c8a84b !important; }
+    /* Sidebar: light background, dark text */
+    [data-testid="stSidebar"] { background: #f4f6f9; border-right: 1px solid #dde3ea; }
+    [data-testid="stSidebar"] * { color: #1a1f2b !important; }
+    [data-testid="stSidebar"] label { color: #3a4150 !important; font-size: 0.82rem; font-weight: 500; }
+    [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #1a3a5c !important; }
+    [data-testid="stSidebar"] .stCaption, [data-testid="stSidebar"] small { color: #5a6272 !important; }
 
     /* Header */
-    .lor-header {
-        background: linear-gradient(135deg, #0d1b2a 0%, #1a3a5c 100%);
-        color: white;
+    .app-header {
+        background: #ffffff;
+        color: #1a1f2b;
         padding: 1.5rem 2rem;
         border-radius: 8px;
         margin-bottom: 1.5rem;
-        border-left: 5px solid #c8a84b;
+        border: 1px solid #dde3ea;
+        border-left: 5px solid #2563eb;
     }
-    .lor-header h1 { margin:0; font-size: 1.6rem; color: white; }
-    .lor-header p  { margin:0.3rem 0 0; color: #a8c8e8; font-size: 0.9rem; }
+    .app-header h1 { margin:0; font-size: 1.6rem; color: #1a1f2b; }
+    .app-header p  { margin:0.3rem 0 0; color: #5a6272; font-size: 0.9rem; }
 
     /* Metric cards */
     .metric-row { display:flex; gap:1rem; margin-bottom:1.5rem; flex-wrap:wrap; }
@@ -47,10 +48,10 @@ st.markdown("""
         flex: 1;
         min-width: 140px;
         text-align: center;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
     }
     .metric-card .val { font-size: 2rem; font-weight: 700; color: #1a3a5c; }
-    .metric-card .lbl { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing:0.05em; margin-top:0.2rem; }
+    .metric-card .lbl { font-size: 0.75rem; color: #5a6272; text-transform: uppercase; letter-spacing:0.05em; margin-top:0.2rem; }
 
     /* D&B risk badges */
     .badge {
@@ -72,7 +73,7 @@ st.markdown("""
         font-size: 1.1rem;
         font-weight: 700;
         color: #1a3a5c;
-        border-bottom: 2px solid #c8a84b;
+        border-bottom: 2px solid #2563eb;
         padding-bottom: 0.4rem;
         margin: 1.5rem 0 1rem;
     }
@@ -88,16 +89,56 @@ st.markdown("""
         font-size: 0.9rem;
         line-height: 1.6;
         white-space: pre-wrap;
+        color: #1a1f2b;
     }
 
-    /* Table styling */
     .stDataFrame { border-radius: 8px; overflow: hidden; }
 
-    /* Hide default streamlit branding */
     #MainMenu { visibility: hidden; }
     footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ADMIN CONFIGURATION
+# ════════════════════════════════════════════════════════════════════════════
+# This app supports a one-time admin setup so end users never need to
+# enter an API key or upload the D&B file themselves.
+#
+# Two ways to provide the OpenAI API key (checked in this order):
+#   1. Streamlit secrets:  .streamlit/secrets.toml -> OPENAI_API_KEY = "sk-..."
+#      (Set this in Streamlit Cloud: App settings -> Secrets)
+#   2. Environment variable: OPENAI_API_KEY
+#
+# Two ways to provide the D&B database (checked in this order):
+#   1. Commit a file named "dnb_database.xlsx" into this repo's root folder.
+#      The app loads it automatically on startup — no upload needed.
+#   2. If neither secret key nor committed file exists, the app falls back
+#      to showing manual input boxes (so it still works before setup).
+# ════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "dnb_database.xlsx")
+
+
+def get_admin_api_key() -> str:
+    """Look for an admin-configured OpenAI key in secrets or env vars."""
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("OPENAI_API_KEY", "")
+
+
+def get_admin_db_df() -> pd.DataFrame | None:
+    """Load the committed D&B database file if it exists in the repo."""
+    if os.path.exists(DEFAULT_DB_PATH):
+        try:
+            return load_excel_any(DEFAULT_DB_PATH)
+        except Exception as e:
+            st.sidebar.error(f"Could not read bundled D&B file: {e}")
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -160,10 +201,10 @@ def risk_badge(risk_str: str) -> str:
     return f'<span class="badge {css}">{risk_str}</span>'
 
 
-def load_excel_any(uploaded_file) -> pd.DataFrame | None:
-    """Generic Excel loader — combines all sheets."""
+def load_excel_any(file_or_path) -> pd.DataFrame | None:
+    """Generic Excel loader — combines all sheets. Accepts a path or uploaded file."""
     try:
-        xl = pd.ExcelFile(uploaded_file)
+        xl = pd.ExcelFile(file_or_path)
         frames = []
         for sh in xl.sheet_names:
             df = xl.parse(sh)
@@ -200,20 +241,6 @@ def find_db_columns(db_df: pd.DataFrame) -> dict:
         "city":    cm.get("citydb") or cm.get("city"),
         "zip":     cm.get("zippostalcodedb") or cm.get("zippostalcode") or cm.get("postcode") or cm.get("zip"),
         "country": cm.get("countryorregiondb") or cm.get("countryorregion") or cm.get("country"),
-    }
-
-
-def find_cline_columns(cline_df: pd.DataFrame) -> dict:
-    """Detect Constructionline export columns. C/Line exports typically include
-    Company Name, Registration Number, and a status/level field (e.g. 'Gold',
-    'Silver', 'SSIP Verified', membership level, or pass/fail status)."""
-    cm = _normalise_cols(cline_df)
-    return {
-        "name":   cm.get("companyname") or cm.get("name") or cm.get("company") or cm.get("suppliername"),
-        "reg":    cm.get("registrationnumber") or cm.get("companynumber") or cm.get("companynr") or cm.get("regno"),
-        "status": cm.get("clinestatus") or cm.get("status") or cm.get("membershiplevel") or cm.get("level")
-                  or cm.get("accreditationlevel") or cm.get("certificationlevel"),
-        "expiry": cm.get("expirydate") or cm.get("expiry") or cm.get("renewaldate"),
     }
 
 
@@ -269,54 +296,24 @@ def lookup_db(db_df: pd.DataFrame, company_name: str, reg_no: str = "") -> dict:
     }
 
 
-def lookup_cline(cline_df: pd.DataFrame, company_name: str, reg_no: str = "") -> dict:
-    """Look up a company in the uploaded Constructionline export.
-    Returns 'Not available' if no C/Line file has been uploaded at all,
-    or 'Not registered' if the file is uploaded but the company isn't in it."""
-    if cline_df is None or cline_df.empty:
-        return {"C/Line": "Not available"}
-
-    cols = find_cline_columns(cline_df)
-    row = _match_row(cline_df, cols["name"], cols["reg"], company_name, reg_no)
-    if row is None:
-        return {"C/Line": "Not registered"}
-
-    status_col = cols.get("status")
-    if status_col and status_col in cline_df.columns:
-        v = row[status_col]
-        val = "" if pd.isna(v) else str(v)
-        return {"C/Line": val if val else "Listed"}
-    return {"C/Line": "Listed"}
-
-
-def call_claude(api_key: str, prompt: str) -> str:
+def call_openai(api_key: str, prompt: str) -> str:
     headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
     body = {
-        "model": "claude-opus-4-6",
-        "max_tokens": 2000,
+        "model": "gpt-4o",
         "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2500,
     }
-    r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=60)
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=60)
     r.raise_for_status()
     data = r.json()
-    return data["content"][0]["text"]
-
-
-def call_gemini(api_key: str, prompt: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=body, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    return data["choices"][0]["message"]["content"]
 
 
 def build_ai_prompt(trade: str, region: str, extra_notes: str) -> str:
-    return f"""You are a UK construction procurement specialist at Laing O'Rourke.
+    return f"""You are a UK construction procurement specialist.
 
 A procurement team member needs you to identify suitable subcontractors for the following:
 
@@ -356,7 +353,6 @@ Rules:
 
 def parse_ai_response(text: str):
     """Extract narrative + list of companies from AI response."""
-    # Split narrative and JSON
     json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     narrative = text
     companies = []
@@ -372,16 +368,13 @@ def parse_ai_response(text: str):
     return narrative, companies
 
 
-def companies_to_df(companies: list, db_df, cline_df, region: str) -> pd.DataFrame:
+def companies_to_df(companies: list, db_df, region: str) -> pd.DataFrame:
     rows = []
     for c in companies:
         name = c.get("company_name", "")
         reg  = c.get("registration_no", "")
 
-        db_info    = lookup_db(db_df, name, reg)
-        cline_info = lookup_cline(cline_df, name, reg)
-
-        # Prefer D&B's own location data if matched, else fall back to AI's guess
+        db_info = lookup_db(db_df, name, reg)
         location = db_info.get("D&B Location") or c.get("location", "")
 
         rows.append({
@@ -392,7 +385,6 @@ def companies_to_df(companies: list, db_df, cline_df, region: str) -> pd.DataFra
             "Location":          location,
             "Contact":           c.get("contact", ""),
             "Turnover":          db_info.get("Turnover", ""),
-            "C/Line":            cline_info.get("C/Line", ""),
             "D&B Risk":          db_info.get("D&B Risk", ""),
             "Website":           c.get("website", ""),
             "AI Notes":          c.get("notes", ""),
@@ -403,12 +395,12 @@ def companies_to_df(companies: list, db_df, cline_df, region: str) -> pd.DataFra
 
 def to_excel_bytes(df: pd.DataFrame, trade: str, region: str) -> bytes:
     buf = io.BytesIO()
+    export_df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Subcontractors")
+        export_df.to_excel(writer, index=False, sheet_name="Subcontractors")
         wb  = writer.book
         ws  = writer.sheets["Subcontractors"]
 
-        # Formats
         hdr_fmt = wb.add_format({
             "bold": True, "bg_color": "#1a3a5c", "font_color": "white",
             "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True,
@@ -416,14 +408,13 @@ def to_excel_bytes(df: pd.DataFrame, trade: str, region: str) -> bytes:
         cell_fmt = wb.add_format({"border": 1, "valign": "top", "text_wrap": True})
         money_fmt = wb.add_format({"border": 1, "valign": "top", "num_format": "£#,##0"})
 
-        col_widths = [30, 16, 50, 12, 35, 30, 14, 14, 18, 35, 45]
-        for i, (col, w) in enumerate(zip(df.columns, col_widths)):
+        col_widths = [30, 16, 50, 12, 35, 30, 14, 18, 35, 45]
+        for i, (col, w) in enumerate(zip(export_df.columns, col_widths)):
             ws.set_column(i, i, w, cell_fmt)
             ws.write(0, i, col, hdr_fmt)
 
-        # Turnover as number where possible
-        turn_idx = list(df.columns).index("Turnover") if "Turnover" in df.columns else -1
-        for row_idx, row in df.iterrows():
+        turn_idx = list(export_df.columns).index("Turnover") if "Turnover" in export_df.columns else -1
+        for row_idx, row in export_df.iterrows():
             for col_idx, val in enumerate(row):
                 if col_idx == turn_idx:
                     try:
@@ -435,7 +426,6 @@ def to_excel_bytes(df: pd.DataFrame, trade: str, region: str) -> bytes:
 
         ws.set_row(0, 30)
 
-        # Meta sheet
         meta = wb.add_worksheet("Search Info")
         meta.write("A1", "Trade Package")
         meta.write("B1", trade)
@@ -448,36 +438,35 @@ def to_excel_bytes(df: pd.DataFrame, trade: str, region: str) -> bytes:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# LOAD ADMIN CONFIG
+# ════════════════════════════════════════════════════════════════════════════
+
+admin_api_key = get_admin_api_key()
+admin_db_df   = get_admin_db_df()
+
+# ════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 🔑 API Keys")
-    claude_key  = st.text_input("Anthropic (Claude) Key", type="password", placeholder="sk-ant-...")
-    gemini_key  = st.text_input("Google (Gemini) Key",    type="password", placeholder="AIza...")
-    ai_provider = st.radio("Active AI", ["Claude", "Gemini"], horizontal=True)
+    st.markdown("## 🔍 Search")
+
+    if admin_api_key and admin_db_df is not None:
+        st.success("✅ Ready to search — no setup needed.")
+        api_key = admin_api_key
+        db_df = admin_db_df
+        st.caption(f"D&B database loaded: {len(db_df):,} records")
+    else:
+        # Fallback: not yet configured by an admin — show manual setup
+        st.warning("⚠️ Admin setup not detected. Enter details below for this session, or see setup instructions at the bottom of the page.")
+        st.markdown("### API Key")
+        api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...", value=admin_api_key)
+        st.markdown("### D&B Database")
+        db_file = st.file_uploader("D&B Excel export", type=["xlsx", "xls"])
+        db_df = load_excel_any(db_file) if db_file else admin_db_df
 
     st.markdown("---")
-    st.markdown("## 📁 Databases")
-
-    st.caption("**D&B (DNBi)** — exported risk/turnover database. Required columns: Company Name, Business Registration Number, Sales (Revenue), Overall Business Risk, City - D&B, Zip/Postal Code - D&B.")
-    db_file = st.file_uploader("D&B Excel export", type=["xlsx", "xls"], key="db_upload")
-    db_df = load_excel_any(db_file) if db_file else None
-    if db_df is not None:
-        st.success(f"✅ D&B loaded — {len(db_df):,} records")
-    else:
-        st.info("⏳ No D&B file uploaded yet")
-
-    st.caption("**Constructionline (C/Line)** — upload when available. Until then, the C/Line column will show 'Not available'.")
-    cline_file = st.file_uploader("Constructionline Excel export", type=["xlsx", "xls"], key="cline_upload")
-    cline_df = load_excel_any(cline_file) if cline_file else None
-    if cline_df is not None:
-        st.success(f"✅ C/Line loaded — {len(cline_df):,} records")
-    else:
-        st.warning("⏳ C/Line not uploaded — column will be blank until provided")
-
-    st.markdown("---")
-    st.markdown("## 🔍 Search Parameters")
+    st.markdown("### Trade & Area")
     trade  = st.selectbox("Trade / Package", ["— Select —"] + TRADE_PACKAGES)
     region = st.selectbox("UK Region / Area", ["— Select —"] + UK_REGIONS)
     extra  = st.text_area("Additional Notes", placeholder="e.g. CHAS accredited, min turnover £10M, experience in healthcare...", height=100)
@@ -485,11 +474,11 @@ with st.sidebar:
     search_btn = st.button("🔍 Find Subcontractors", use_container_width=True, type="primary")
 
     st.markdown("---")
-    st.markdown("## 📋 Previous Results")
+    st.markdown("### Previous Searches")
     if "history" not in st.session_state:
         st.session_state.history = []
     if st.session_state.history:
-        for i, h in enumerate(reversed(st.session_state.history[-5:])):
+        for h in reversed(st.session_state.history[-5:]):
             st.caption(f"• {h['trade'][:35]}… | {h['region'][:20]}")
     else:
         st.caption("No searches yet.")
@@ -500,54 +489,39 @@ with st.sidebar:
 # ════════════════════════════════════════════════════════════════════════════
 
 st.markdown("""
-<div class="lor-header">
-  <h1>🏗️ Subcontractor Finder</h1>
-  <p>AI-powered UK subcontractor discovery for Laing O'Rourke Procurement</p>
+<div class="app-header">
+  <h1>🔍 Subcontractor Finder</h1>
+  <p>AI-powered UK subcontractor discovery, cross-referenced against your D&B database</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── How-to guide ─────────────────────────────────────────────────────────────
 with st.expander("ℹ️ How to use this tool", expanded=False):
     st.markdown("""
-    1. **Add your API key** in the sidebar — Claude (Anthropic) or Gemini (Google).
-    2. **Upload your D&B (DNBi) Excel export** — required columns: `Company Name`, `Business Registration Number`, `Sales (Revenue)`, `Overall Business Risk`, `City - D&B`, `Zip/Postal Code - D&B`. The app matches AI-suggested companies against this file by name (and registration number as a fallback) to populate **Turnover**, **D&B Risk**, and **Location**.
-    3. **Upload a Constructionline (C/Line) export when you have one.** Until then, the **C/Line** column will simply show *"Not available"* — the app will automatically start filling it in as soon as a file is uploaded, no code changes needed.
-    4. **Select a Trade Package and UK Region**, add any extra notes (minimum turnover, accreditations, etc.).
-    5. Click **Find Subcontractors** — the AI researches suitable suppliers; the app cross-references D&B and C/Line and returns a structured table.
-    6. **Review and edit** the table inline, then **export to Excel or CSV**.
+    1. **Select a Trade Package and UK Region** in the sidebar, add any extra notes (minimum turnover, accreditations, etc.).
+    2. Click **Find Subcontractors** — AI researches suitable suppliers and the app cross-references them against the D&B database.
+    3. **Review and edit** the table inline, then **export to Excel or CSV**.
 
-    **D&B (DNBi) file format** — columns expected (case-insensitive, minor naming variants tolerated):
-    `Company Name`, `Business Registration Number`, `Sales (Revenue)`, `Overall Business Risk`, `City - D&B`, `Zip/Postal Code - D&B`, `Country or Region - D&B`
-
-    **Constructionline file format** — typically:
-    `Company Name`, `Registration Number`, and a status/level column (e.g. `Status`, `Membership Level`, `Accreditation Level`) — column names are auto-detected.
+    If you see a setup warning in the sidebar, the admin API key and D&B database haven't been configured yet for this deployment — see **Admin Setup** at the bottom of this page.
     """)
 
-# ── Session state init ────────────────────────────────────────────────────────
-if "result_df"  not in st.session_state: st.session_state.result_df  = None
-if "narrative"  not in st.session_state: st.session_state.narrative  = ""
-if "last_trade" not in st.session_state: st.session_state.last_trade = ""
-if "last_region"not in st.session_state: st.session_state.last_region= ""
+if "result_df"   not in st.session_state: st.session_state.result_df   = None
+if "narrative"   not in st.session_state: st.session_state.narrative   = ""
+if "last_trade"  not in st.session_state: st.session_state.last_trade  = ""
+if "last_region" not in st.session_state: st.session_state.last_region = ""
 
 # ── Search execution ──────────────────────────────────────────────────────────
 if search_btn:
     if trade == "— Select —" or region == "— Select —":
         st.warning("Please select both a Trade Package and a UK Region before searching.")
-    elif ai_provider == "Claude" and not claude_key:
-        st.error("Please enter your Anthropic (Claude) API key in the sidebar.")
-    elif ai_provider == "Gemini" and not gemini_key:
-        st.error("Please enter your Google (Gemini) API key in the sidebar.")
+    elif not api_key:
+        st.error("No OpenAI API key available. Ask your admin to configure one, or enter one in the sidebar.")
     else:
         with st.spinner(f"Searching for {trade} subcontractors in {region}…"):
             prompt = build_ai_prompt(trade, region, extra)
             try:
-                if ai_provider == "Claude":
-                    raw = call_claude(claude_key, prompt)
-                else:
-                    raw = call_gemini(gemini_key, prompt)
-
+                raw = call_openai(api_key, prompt)
                 narrative, companies = parse_ai_response(raw)
-                df = companies_to_df(companies, db_df, cline_df, region)
+                df = companies_to_df(companies, db_df, region)
 
                 st.session_state.result_df   = df
                 st.session_state.narrative   = narrative
@@ -569,13 +543,10 @@ if st.session_state.result_df is not None:
     trde = st.session_state.last_trade
     rgn  = st.session_state.last_region
 
-    # Metric cards
     total      = len(df)
-    with_db    = int(df.get("_db_matched", pd.Series([False]*len(df))).sum()) if "_db_matched" in df.columns else int(df["D&B Risk"].astype(bool).sum())
+    with_db    = int(df.get("_db_matched", pd.Series([False]*len(df))).sum()) if "_db_matched" in df.columns else 0
     low_risk   = df["D&B Risk"].str.lower().str.contains("low", na=False).sum()
     local_cnt  = (pd.to_numeric(df["Close to Area"], errors="coerce") >= 7).sum()
-    cline_avail = cline_df is not None
-    cline_matched = (df["C/Line"].astype(str) != "Not available").sum() if cline_avail else 0
 
     st.markdown(f"""
     <div class="metric-row">
@@ -586,15 +557,10 @@ if st.session_state.result_df is not None:
     </div>
     """, unsafe_allow_html=True)
 
-    if not cline_avail:
-        st.info("ℹ️ Constructionline (C/Line) file not uploaded yet — that column will read **'Not available'** until you upload a C/Line export in the sidebar.")
-
-    # AI narrative
     if nav:
         st.markdown('<div class="section-title">📊 Market Overview</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="ai-box">{nav}</div>', unsafe_allow_html=True)
 
-    # Filters
     st.markdown('<div class="section-title">🔧 Filter & Export</div>', unsafe_allow_html=True)
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -605,7 +571,6 @@ if st.session_state.result_df is not None:
     with col3:
         sort_by = st.selectbox("Sort by", ["Close to Area ↓", "Company Name ↑", "D&B Risk"])
 
-    # Apply filters
     view = df.copy()
     if risk_filt != "All":
         view = view[view["D&B Risk"] == risk_filt]
@@ -623,10 +588,11 @@ if st.session_state.result_df is not None:
         view["_sort"] = view["D&B Risk"].map(order).fillna(99)
         view = view.sort_values("_sort").drop(columns=["_sort"])
 
-    # Editable table
+    display_cols = [c for c in view.columns if not c.startswith("_")]
+
     st.markdown(f"**{len(view)} companies shown** — you can edit cells directly:")
     edited = st.data_editor(
-        view.reset_index(drop=True),
+        view[display_cols].reset_index(drop=True),
         use_container_width=True,
         num_rows="dynamic",
         column_config={
@@ -640,7 +606,6 @@ if st.session_state.result_df is not None:
         height=500,
     )
 
-    # Export
     st.markdown('<div class="section-title">⬇️ Export</div>', unsafe_allow_html=True)
     col_a, col_b = st.columns(2)
     with col_a:
@@ -663,16 +628,43 @@ if st.session_state.result_df is not None:
             use_container_width=True,
         )
 
-    # Raw AI toggle
     with st.expander("🤖 Raw AI Response", expanded=False):
         st.text(st.session_state.get("raw_ai", ""))
 
 else:
-    # Empty state
     st.markdown("""
-    <div style="text-align:center; padding:4rem 2rem; color:#999;">
+    <div style="text-align:center; padding:4rem 2rem; color:#5a6272;">
         <div style="font-size:4rem;">🔍</div>
-        <h3 style="color:#ccc;">Ready to search</h3>
+        <h3 style="color:#3a4150;">Ready to search</h3>
         <p>Select a Trade Package and UK Region in the sidebar, then click <strong>Find Subcontractors</strong>.</p>
     </div>
     """, unsafe_allow_html=True)
+
+# ── Admin setup instructions (always visible at bottom, collapsed) ───────────
+st.markdown("---")
+with st.expander("🛠️ Admin Setup (one-time, do this so users never need to upload anything)", expanded=False):
+    st.markdown("""
+    **Step 1 — Add your OpenAI API key as a Streamlit secret**
+
+    In Streamlit Cloud: open your app → **Settings → Secrets** → paste:
+    ```toml
+    OPENAI_API_KEY = "sk-your-key-here"
+    ```
+    Save. The app will pick it up automatically — no user ever sees or enters it.
+
+    **Step 2 — Commit the D&B database into the GitHub repo**
+
+    Rename your D&B export to exactly `dnb_database.xlsx` and add it to the root of the repository (same folder as `app.py`). Push to GitHub — Streamlit Cloud redeploys automatically and loads the file on every app start.
+
+    ```
+    your-repo/
+    ├── app.py
+    ├── requirements.txt
+    ├── dnb_database.xlsx   ← admin-provided, loaded automatically
+    └── README.md
+    ```
+
+    To update the database later, just replace `dnb_database.xlsx` in the repo and push — no code changes needed.
+
+    Once both are in place, the sidebar will show **"✅ Ready to search"** and end users will only see the trade/area search boxes.
+    """)
