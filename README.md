@@ -1,4 +1,4 @@
-# 🏗️ Subcontractor Finder — Laing O'Rourke Procurement
+# 🏗️ Subcontractor Finder
 
 AI-powered UK subcontractor discovery tool. Enter a trade package and UK region; Claude or Gemini researches suitable subcontractors and returns a structured, exportable table matched against your D&B database.
 
