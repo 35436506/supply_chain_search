@@ -354,6 +354,7 @@ def lookup_db(db_df: pd.DataFrame, company_name: str, reg_no: str = "") -> dict:
         "D&B Risk":     safe("risk"),
         "Turnover":     safe("sales"),
         "D&B Location": location,
+        "reg":          safe("reg"),
         "_db_matched":  True,
     }
 
@@ -728,78 +729,69 @@ def companies_to_df(companies: list, db_df, supplier_df, trade: str, region: str
         ai_name = c.get("company_name", "")
         ai_reg  = c.get("registration_no", "")
 
-        db_info  = lookup_db(db_df, ai_name, ai_reg)
-        pref     = find_preferred_match(supplier_df, trade, ai_name, ai_reg)
+        db_info = lookup_db(db_df, ai_name, ai_reg)
+        pref    = find_preferred_match(supplier_df, trade, ai_name, ai_reg)
 
         is_verified = bool(db_info.get("_db_matched")) or bool(pref.get("is_preferred"))
 
-        # Verified data always wins over whatever the AI claimed. Preference
-        # order when both exist: preferred-supplier record, then D&B record,
-        # since the supplier list is your own curated/vetted data.
-        if pref.get("is_preferred"):
-            name = pref.get("company_name") or ai_name
-            reg  = pref.get("registration_no") or ai_reg
-            verified_location = pref.get("location", "")
-            verified_turnover = pref.get("turnover", "")
-            verified_risk     = pref.get("db_risk", "")
+        # ── Company name ──────────────────────────────────────────────────────
+        # Preferred supplier list is the most authoritative source for name.
+        name = pref.get("company_name") or ai_name
+
+        # ── Registration number ───────────────────────────────────────────────
+        # ONLY show a registration number that came from a trusted source file.
+        # Never show what the AI suggested — it is unreliable and misleads users.
+        if pref.get("registration_no"):
+            reg_display = pref["registration_no"]          # from preferred supplier list
+        elif db_info.get("_db_matched") and db_info.get("reg"):
+            reg_display = db_info["reg"]                   # from D&B record
         else:
-            name = ai_name
-            reg  = ai_reg
-            verified_location = ""
-            verified_turnover = ""
-            verified_risk     = ""
+            reg_display = ""                               # unknown — leave blank
 
-        # D&B fills any gaps the preferred-supplier record didn't have
-        location = verified_location or db_info.get("D&B Location") or (ai_name and c.get("location", "")) or ""
-        db_risk  = verified_risk or db_info.get("D&B Risk", "")
+        # ── Location ──────────────────────────────────────────────────────────
+        location = (pref.get("location") or db_info.get("D&B Location")
+                    or c.get("location", ""))
 
-        # Turnover precedence: verified preferred-supplier figure > D&B figure
-        # > AI estimate (clearly flagged as such)
-        db_turnover = db_info.get("Turnover", "")
-        ai_turnover = c.get("estimated_turnover", None)
+        # ── Risk ──────────────────────────────────────────────────────────────
+        db_risk = pref.get("db_risk") or db_info.get("D&B Risk", "")
+
+        # ── Turnover ──────────────────────────────────────────────────────────
+        # Precedence: preferred-supplier list > D&B > AI estimate
+        pref_turn  = pref.get("turnover", "")
+        db_turn    = db_info.get("Turnover", "")
+        ai_turn    = c.get("estimated_turnover", None)
         is_estimate = False
 
-        if verified_turnover:
-            turnover = verified_turnover
-            turnover_source = "Preferred Supplier List"
-        elif db_turnover:
-            turnover = db_turnover
-            turnover_source = "D&B"
-        elif ai_turnover is not None:
-            turnover = ai_turnover
-            turnover_source = "Estimated (unverified)"
+        if pref_turn:
+            turnover = pref_turn
+        elif db_turn:
+            turnover = db_turn
+        elif ai_turn is not None:
+            turnover = ai_turn
             is_estimate = True
         else:
             turnover = ""
-            turnover_source = ""
-
-        # Registration number is only shown if it came from a verified source —
-        # an AI-only registration number is too unreliable to present as fact.
-        if not (pref.get("registration_no") or db_info.get("_db_matched")):
-            reg_display = ""
-        else:
-            reg_display = reg
 
         lat, lon = geocode_location(location)
 
         rows.append({
-            "Company Name":      name,
-            "Registration No.":  reg_display,
-            "Trade Scope":       c.get("trade_scope", ""),
-            "Close to Area":     c.get("proximity_score", ""),
-            "Location":          location,
-            "Turnover":          turnover,
-            "Company Size":      turnover_to_size_band(turnover),
+            "Company Name":        name,
+            "Registration No.":    reg_display,
+            "Trade Scope":         c.get("trade_scope", ""),
+            "Location":            location,
+            "Turnover":            turnover,
+            "Company Size":        turnover_to_size_band(turnover),
             "Number of Employees": turnover_to_employee_estimate(turnover),
-            "D&B Risk":          db_risk,
-            "Preferred Supplier": "Yes" if pref.get("is_preferred") else "",
-            "C/Line Level":       pref.get("cline_level", "") if pref.get("is_preferred") else "",
-            "Contact":            pref.get("key_contact", "") if pref.get("is_preferred") else "",
-            "Email":              pref.get("email", "") if pref.get("is_preferred") else "",
-            "Phone":              pref.get("phone", "") if pref.get("is_preferred") else "",
-            "Notes":              c.get("notes", ""),
-            "_verified":          is_verified,
-            "_db_matched":        bool(db_info.get("_db_matched")),
+            "D&B Risk":            db_risk,
+            "C/Line Level":        pref.get("cline_level", "") if pref.get("is_preferred") else "",
+            "Contact":             pref.get("key_contact", "") if pref.get("is_preferred") else "",
+            "Email":               pref.get("email", "") if pref.get("is_preferred") else "",
+            "Phone":               pref.get("phone", "") if pref.get("is_preferred") else "",
+            "Notes":               c.get("notes", ""),
+            "Preferred Supplier":  "Yes" if pref.get("is_preferred") else "",
+            "Close to Area":       c.get("proximity_score", ""),  # raw score, ranked later
+            "_verified":           is_verified,
+            "_db_matched":         bool(db_info.get("_db_matched")),
             "_turnover_is_estimate": is_estimate,
             "_lat": lat,
             "_lon": lon,
@@ -1005,11 +997,12 @@ if st.session_state.result_df is not None:
         na_position="last",
     ).drop(columns=["_turn_sort", "_size_sort", "_pref_sort"])
 
-    # Replace raw AI proximity score (1–10) with a simple rank across the
-    # actual result set: rank 1 = closest to the target area, rank N = furthest.
-    # Higher original score = closer, so rank by descending score.
+    # Convert raw AI proximity score (1–10) to a unique rank across the actual
+    # result set: rank 1 = closest to target area, rank N = furthest.
+    # method="first" ensures every company gets a distinct rank even when
+    # the AI gave them the same proximity score.
     view["Close to Area"] = view["_prox_sort"].rank(
-        ascending=False, method="min", na_option="bottom"
+        ascending=False, method="first", na_option="bottom"
     ).astype("Int64")
     view = view.drop(columns=["_prox_sort"])
 
