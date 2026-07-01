@@ -424,14 +424,24 @@ def load_preferred_suppliers(file_or_path) -> pd.DataFrame | None:
     if cm.get("companyname") is None:
         df, cm = _try_parse(0)
 
-    pkg_col    = cm.get("package")
-    name_col   = cm.get("companyname")
-    status_col = cm.get("status")
-    reg_col    = cm.get("registrationno")
-    addr_col   = cm.get("tradingaddress")
-    turn_col   = cm.get("turnover")
-    risk_col   = cm.get("dnbirisk")
-    cline_col  = cm.get("clinelevel")
+    # Strip whitespace first, then deduplicate — the cluster export has
+    # "Email" and "Email " (trailing space) which become duplicates after strip.
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+    cm = _normalise_cols(df)
+
+    pkg_col       = cm.get("package")
+    name_col      = cm.get("companyname")
+    status_col    = cm.get("status")
+    reg_col       = cm.get("registrationno")
+    addr_col      = cm.get("tradingaddress")
+    turn_col      = cm.get("turnover")
+    risk_col      = cm.get("dnbirisk")
+    cline_col     = cm.get("clinelevel")
+    contact_col   = cm.get("keycontact")
+    email_col     = cm.get("email")
+    phone_col     = cm.get("phone")
 
     if name_col is None:
         return None
@@ -448,6 +458,9 @@ def load_preferred_suppliers(file_or_path) -> pd.DataFrame | None:
         "Turnover":         turn_col,
         "D&B Risk":         risk_col,
         "C/Line Level":     cline_col,
+        "Key Contact":      contact_col,
+        "Email":            email_col,
+        "Phone":            phone_col,
     }
     out = pd.DataFrame()
     for new_col, old_col in keep.items():
@@ -511,16 +524,19 @@ def find_preferred_match(supplier_df: pd.DataFrame, trade: str, company_name: st
         return str(v) if pd.notna(v) else ""
 
     return {
-        "is_preferred":       True,
-        "status":             safe("Status"),
-        "package":            safe("Package"),
-        "cluster":            safe("Cluster"),
-        "company_name":       safe("Company Name"),
-        "registration_no":    safe("Registration No."),
-        "location":           safe("Trading Address"),
-        "turnover":           safe("Turnover"),
-        "db_risk":            safe("D&B Risk"),
-        "cline_level":        safe("C/Line Level"),
+        "is_preferred":    True,
+        "status":          safe("Status"),
+        "package":         safe("Package"),
+        "cluster":         safe("Cluster"),
+        "company_name":    safe("Company Name"),
+        "registration_no": safe("Registration No."),
+        "location":        safe("Trading Address"),
+        "turnover":        safe("Turnover"),
+        "db_risk":         safe("D&B Risk"),
+        "cline_level":     safe("C/Line Level"),
+        "key_contact":     safe("Key Contact"),
+        "email":           safe("Email"),
+        "phone":           safe("Phone"),
     }
 
 
@@ -783,11 +799,15 @@ def companies_to_df(companies: list, db_df, supplier_df, trade: str, region: str
             "Number of Employees": turnover_to_employee_estimate(turnover),
             "D&B Risk":          db_risk,
             "Preferred Supplier": "Yes" if pref.get("is_preferred") else "",
-            "Preferred Cluster": pref.get("cluster", "") if pref.get("is_preferred") else "",
-            "Website":           website_display,
-            "Notes":             c.get("notes", ""),
-            "_verified":         is_verified,
-            "_db_matched":       bool(db_info.get("_db_matched")),
+            "Preferred Cluster":  pref.get("cluster", "") if pref.get("is_preferred") else "",
+            "C/Line Level":       pref.get("cline_level", "") if pref.get("is_preferred") else "",
+            "Contact":            pref.get("key_contact", "") if pref.get("is_preferred") else "",
+            "Email":              pref.get("email", "") if pref.get("is_preferred") else "",
+            "Phone":              pref.get("phone", "") if pref.get("is_preferred") else "",
+            "Website":            website_display,
+            "Notes":              c.get("notes", ""),
+            "_verified":          is_verified,
+            "_db_matched":        bool(db_info.get("_db_matched")),
             "_turnover_is_estimate": is_estimate,
             "_lat": lat,
             "_lon": lon,
@@ -810,7 +830,7 @@ def to_excel_bytes(df: pd.DataFrame, trade: str, region: str) -> bytes:
         cell_fmt = wb.add_format({"border": 1, "valign": "top", "text_wrap": True})
         money_fmt = wb.add_format({"border": 1, "valign": "top", "num_format": "£#,##0"})
 
-        col_widths = [30, 16, 50, 12, 35, 14, 14, 18, 18, 14, 14, 16, 35, 45]
+        col_widths = [5, 30, 16, 50, 12, 35, 14, 14, 18, 18, 14, 14, 16, 14, 28, 32, 16, 35, 45]
         for i, (col, w) in enumerate(zip(export_df.columns, col_widths)):
             ws.set_column(i, i, w, cell_fmt)
             ws.write(0, i, col, hdr_fmt)
@@ -887,20 +907,9 @@ with st.sidebar:
 st.markdown("""
 <div class="app-header">
   <h1>🔍 Subcontractor Finder</h1>
-  <p>AI-powered UK subcontractor discovery, cross-referenced against your D&B database</p>
+  <p>UK subcontractor discovery, cross-referenced against D&B and Preferred Supplier data</p>
 </div>
 """, unsafe_allow_html=True)
-
-with st.expander("ℹ️ How to use this tool", expanded=False):
-    st.markdown("""
-    1. **Pick a Trade/Package** from the dropdown — or just type a trade in the search box.
-    2. **Pick a UK Region**, or enter a specific town/city/postcode for a smaller area.
-    3. Add any extra notes (minimum turnover, accreditations, etc.), then click **Find Subcontractors**.
-    4. Results are cross-referenced against D&B and Preferred Supplier data, sorted by **Preferred → Turnover → Company Size → Proximity**.
-    5. **Review the map**, **edit the table** inline, then **export to Excel**.
-
-    Only companies matched in the D&B or Preferred Supplier databases are verified. Anything else is AI-suggested and marked **"(unverified)"** — always confirm independently before contacting a supplier.
-    """)
 
 if "result_df"   not in st.session_state: st.session_state.result_df   = None
 if "narrative"   not in st.session_state: st.session_state.narrative   = ""
@@ -1113,13 +1122,17 @@ if st.session_state.result_df is not None:
         use_container_width=True,
         num_rows="dynamic",
         column_config={
-            "#":                   st.column_config.NumberColumn("#", width="small"),
-            "Website":             st.column_config.TextColumn("Website"),
-            "Close to Area":       st.column_config.NumberColumn("Close to Area", min_value=1, max_value=10),
-            "Trade Scope":         st.column_config.TextColumn("Trade Scope", width="large"),
-            "Notes":               st.column_config.TextColumn("Notes", width="large"),
-            "Turnover":            st.column_config.NumberColumn("Turnover (£)", format="£%d"),
-            "Preferred Supplier":  st.column_config.TextColumn("Preferred Supplier"),
+            "#":                     st.column_config.NumberColumn("#", width="small"),
+            "Website":               st.column_config.TextColumn("Website"),
+            "Close to Area":         st.column_config.NumberColumn("Close to Area", min_value=1, max_value=10),
+            "Trade Scope":           st.column_config.TextColumn("Trade Scope", width="large"),
+            "Notes":                 st.column_config.TextColumn("Notes", width="large"),
+            "Turnover":              st.column_config.NumberColumn("Turnover (£)", format="£%d"),
+            "Preferred Supplier":    st.column_config.TextColumn("Preferred Supplier"),
+            "C/Line Level":          st.column_config.TextColumn("C/Line Level"),
+            "Contact":               st.column_config.TextColumn("Contact"),
+            "Email":                 st.column_config.TextColumn("Email"),
+            "Phone":                 st.column_config.TextColumn("Phone"),
         },
         hide_index=True,
         height=500,
@@ -1135,9 +1148,6 @@ if st.session_state.result_df is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
-
-    with st.expander("🤖 Raw AI Response", expanded=False):
-        st.text(st.session_state.get("raw_ai", ""))
 
 else:
     st.markdown("""
