@@ -776,14 +776,9 @@ def companies_to_df(companies: list, db_df, supplier_df, trade: str, region: str
         # Registration number is only shown if it came from a verified source —
         # an AI-only registration number is too unreliable to present as fact.
         if not (pref.get("registration_no") or db_info.get("_db_matched")):
-            reg_display = f"{ai_reg} (unverified)" if ai_reg else ""
+            reg_display = ""
         else:
             reg_display = reg
-
-        # Website was never in any source data — always AI-suggested, so it's
-        # labelled as such rather than presented as a verified fact.
-        ai_website = c.get("website", "")
-        website_display = f"{ai_website} (unverified — please confirm)" if ai_website else ""
 
         lat, lon = geocode_location(location)
 
@@ -794,17 +789,14 @@ def companies_to_df(companies: list, db_df, supplier_df, trade: str, region: str
             "Close to Area":     c.get("proximity_score", ""),
             "Location":          location,
             "Turnover":          turnover,
-            "Turnover Source":   turnover_source,
             "Company Size":      turnover_to_size_band(turnover),
             "Number of Employees": turnover_to_employee_estimate(turnover),
             "D&B Risk":          db_risk,
             "Preferred Supplier": "Yes" if pref.get("is_preferred") else "",
-            "Preferred Cluster":  pref.get("cluster", "") if pref.get("is_preferred") else "",
             "C/Line Level":       pref.get("cline_level", "") if pref.get("is_preferred") else "",
             "Contact":            pref.get("key_contact", "") if pref.get("is_preferred") else "",
             "Email":              pref.get("email", "") if pref.get("is_preferred") else "",
             "Phone":              pref.get("phone", "") if pref.get("is_preferred") else "",
-            "Website":            website_display,
             "Notes":              c.get("notes", ""),
             "_verified":          is_verified,
             "_db_matched":        bool(db_info.get("_db_matched")),
@@ -907,7 +899,9 @@ with st.sidebar:
 st.markdown("""
 <div class="app-header">
   <h1>🔍 Subcontractor Finder</h1>
-  <p>UK subcontractor discovery, cross-referenced against D&B and Preferred Supplier data</p>
+  <p>UK subcontractor discovery, cross-referenced against D&B and Preferred Supplier data &nbsp;·&nbsp;
+  <a href="https://find-and-update.company-information.service.gov.uk/" target="_blank" style="color:#93c5fd;">
+  🏛️ Search Companies House</a></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -981,9 +975,9 @@ if st.session_state.result_df is not None:
     unverified_cnt = total - verified_cnt
     if unverified_cnt > 0:
         st.warning(
-            f"⚠️ {unverified_cnt} of {total} companies are **not** in your D&B or Preferred Supplier data — "
-            f"their registration number, location, turnover and website are AI-suggested only and marked "
-            f"**'(unverified)'** in the table below. Please independently confirm these before contacting any supplier."
+            f"⚠️ {unverified_cnt} of {total} companies were not found in your D&B or Preferred Supplier data — "
+            f"their registration number is left blank. Please verify these companies on "
+            f"[Companies House](https://find-and-update.company-information.service.gov.uk/) before contacting them."
         )
 
     if nav:
@@ -1116,14 +1110,13 @@ if st.session_state.result_df is not None:
 
     display_cols = [c for c in view.columns if not c.startswith("_")]
 
-    st.markdown(f"**{len(view)} companies shown**, sorted by Preferred Supplier → Turnover → Company Size → Proximity — you can edit cells directly. Fields marked **'(unverified)'** were not found in your D&B or Preferred Supplier data and should be independently confirmed before use.")
+    st.markdown(f"**{len(view)} companies shown**, sorted by Preferred Supplier → Turnover → Company Size → Proximity. Registration numbers are only shown when verified against D&B or your Preferred Supplier list — use [Companies House](https://find-and-update.company-information.service.gov.uk/) to look up any with a blank registration number.")
     edited = st.data_editor(
         view[display_cols].reset_index(drop=True),
         use_container_width=True,
         num_rows="dynamic",
         column_config={
             "#":                     st.column_config.NumberColumn("#", width="small"),
-            "Website":               st.column_config.TextColumn("Website"),
             "Close to Area":         st.column_config.NumberColumn("Close to Area", min_value=1, max_value=10),
             "Trade Scope":           st.column_config.TextColumn("Trade Scope", width="large"),
             "Notes":                 st.column_config.TextColumn("Notes", width="large"),
