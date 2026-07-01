@@ -109,9 +109,9 @@ st.markdown("""
 # This app supports a one-time admin setup so end users never need to
 # enter an API key or upload files themselves.
 #
-# API keys (checked in this order):
-#   1. Streamlit secrets: .streamlit/secrets.toml -> OPENAI_API_KEY / GEMINI_API_KEY
-#   2. Environment variables
+# API key (checked in this order):
+#   1. Streamlit secrets: .streamlit/secrets.toml -> GEMINI_API_KEY
+#   2. Environment variable: GEMINI_API_KEY
 #
 # Reference files (checked in this order):
 #   1. Commit a file/folder with the matching name into this repo's root —
@@ -131,15 +131,14 @@ DEFAULT_WP_PATH       = os.path.join(os.path.dirname(__file__), "wp_list.xlsx")
 DEFAULT_SUPPLIER_DIR  = os.path.join(os.path.dirname(__file__), "preferred_suppliers")
 
 
-def get_admin_api_key(provider: str) -> str:
-    """Look for an admin-configured key in secrets or env vars, per provider."""
-    secret_name = "OPENAI_API_KEY" if provider == "ChatGPT (OpenAI)" else "GEMINI_API_KEY"
+def get_admin_api_key() -> str:
+    """Look for an admin-configured Gemini key in secrets or env vars."""
     try:
-        if secret_name in st.secrets:
-            return st.secrets[secret_name]
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
     except Exception:
         pass
-    return os.environ.get(secret_name, "")
+    return os.environ.get("GEMINI_API_KEY", "")
 
 
 def get_admin_db_df() -> pd.DataFrame | None:
@@ -300,25 +299,33 @@ def find_db_columns(db_df: pd.DataFrame) -> dict:
 
 
 def _match_row(df: pd.DataFrame, name_col, reg_col, company_name: str, reg_no: str = ""):
-    """Find best matching row by company name (exact -> partial) or registration number."""
+    """Find best matching row by registration number first (most reliable),
+    then a normalised exact name match, then a conservative bidirectional
+    partial match as a last resort. Avoids loose substring matches that can
+    attach the wrong company's verified data to an AI-suggested name."""
     if name_col is None or name_col not in df.columns:
         return None
 
-    name_norm = str(company_name).lower().strip()
-    mask = df[name_col].astype(str).str.lower().str.strip() == name_norm
+    # 1. Registration number — most reliable
+    if reg_no and reg_col and reg_col in df.columns:
+        reg_mask = df[reg_col].astype(str).str.strip().str.upper() == str(reg_no).strip().upper()
+        if reg_mask.any():
+            return df[reg_mask].iloc[0]
 
-    if not mask.any():
-        mask = df[name_col].astype(str).str.lower().str.contains(
-            re.escape(name_norm[:15]), na=False
-        )
+    # 2. Normalised exact name match
+    target_norm = _normalise_company_name(company_name)
+    name_norms = df[name_col].astype(str).apply(_normalise_company_name)
+    exact_mask = name_norms == target_norm
+    if exact_mask.any():
+        return df[exact_mask].iloc[0]
 
-    if not mask.any() and reg_no and reg_col and reg_col in df.columns:
-        mask = df[reg_col].astype(str).str.strip().str.upper() == str(reg_no).strip().upper()
+    # 3. Conservative bidirectional partial match
+    if len(target_norm) >= 6:
+        partial_mask = name_norms.apply(lambda n: target_norm in n or n in target_norm)
+        if partial_mask.any():
+            return df[partial_mask].iloc[0]
 
-    if not mask.any():
-        return None
-
-    return df[mask].iloc[0]
+    return None
 
 
 def lookup_db(db_df: pd.DataFrame, company_name: str, reg_no: str = "") -> dict:
@@ -451,27 +458,69 @@ def load_preferred_suppliers(file_or_path) -> pd.DataFrame | None:
     return out.reset_index(drop=True)
 
 
-def find_preferred_match(supplier_df: pd.DataFrame, trade: str, company_name: str) -> dict:
+def _normalise_company_name(name: str) -> str:
+    """Normalise a company name for safer matching: lowercase, strip common
+    suffixes (Ltd, Limited, etc.) and punctuation, collapse whitespace."""
+    n = str(name).lower().strip()
+    n = re.sub(r"[.,&()]", " ", n)
+    n = re.sub(r"\b(ltd|limited|llp|plc|group|inc|co)\b", "", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return n
+
+
+def find_preferred_match(supplier_df: pd.DataFrame, trade: str, company_name: str, reg_no: str = "") -> dict:
     """Check whether a company appears in any loaded preferred supplier
-    cluster list."""
+    cluster list. Uses registration number as the most reliable signal when
+    available, then a normalised exact-name match, then a conservative
+    partial match only as a last resort — all to avoid attaching the wrong
+    company's verified data to an AI-suggested name."""
     if supplier_df is None or supplier_df.empty:
         return {"is_preferred": False}
 
-    name_norm = str(company_name).lower().strip()
-    mask = supplier_df["Company Name"].astype(str).str.lower().str.strip() == name_norm
-    if not mask.any():
-        mask = supplier_df["Company Name"].astype(str).str.lower().str.contains(
-            re.escape(name_norm[:15]), na=False
-        )
-    if not mask.any():
+    row = None
+
+    # 1. Registration number match — most reliable, avoids name-spelling drift
+    if reg_no and "Registration No." in supplier_df.columns:
+        reg_mask = supplier_df["Registration No."].astype(str).str.strip().str.upper() == str(reg_no).strip().upper()
+        if reg_mask.any():
+            row = supplier_df[reg_mask].iloc[0]
+
+    # 2. Normalised exact name match (ignores Ltd/Limited/punctuation differences)
+    if row is None:
+        target_norm = _normalise_company_name(company_name)
+        name_norms = supplier_df["Company Name"].astype(str).apply(_normalise_company_name)
+        exact_mask = name_norms == target_norm
+        if exact_mask.any():
+            row = supplier_df[exact_mask].iloc[0]
+
+    # 3. Conservative partial match — only if the AI name is a clear substring
+    #    match in both directions (handles things like trading-name variants)
+    if row is None:
+        target_norm = _normalise_company_name(company_name)
+        if len(target_norm) >= 6:
+            name_norms = supplier_df["Company Name"].astype(str).apply(_normalise_company_name)
+            partial_mask = name_norms.apply(lambda n: target_norm in n or n in target_norm)
+            if partial_mask.any():
+                row = supplier_df[partial_mask].iloc[0]
+
+    if row is None:
         return {"is_preferred": False}
 
-    row = supplier_df[mask].iloc[0]
+    def safe(col):
+        v = row.get(col, "")
+        return str(v) if pd.notna(v) else ""
+
     return {
-        "is_preferred": True,
-        "status": str(row.get("Status", "")) if pd.notna(row.get("Status", "")) else "",
-        "package": str(row.get("Package", "")) if pd.notna(row.get("Package", "")) else "",
-        "cluster": str(row.get("Cluster", "")) if pd.notna(row.get("Cluster", "")) else "",
+        "is_preferred":       True,
+        "status":             safe("Status"),
+        "package":            safe("Package"),
+        "cluster":            safe("Cluster"),
+        "company_name":       safe("Company Name"),
+        "registration_no":    safe("Registration No."),
+        "location":           safe("Trading Address"),
+        "turnover":           safe("Turnover"),
+        "db_risk":            safe("D&B Risk"),
+        "cline_level":        safe("C/Line Level"),
     }
 
 
@@ -562,22 +611,6 @@ def _post_with_retry(url, headers, body, timeout=60, max_retries=3, backoff_base
         raise last_exc
 
 
-def call_openai(api_key: str, prompt: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2500,
-    }
-    r = _post_with_retry("https://api.openai.com/v1/chat/completions", headers, body)
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"]
-
-
 def call_gemini(api_key: str, prompt: str) -> str:
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
@@ -588,33 +621,21 @@ def call_gemini(api_key: str, prompt: str) -> str:
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def call_ai(provider: str, api_key: str, prompt: str) -> str:
-    if provider == "ChatGPT (OpenAI)":
-        return call_openai(api_key, prompt)
-    else:
-        return call_gemini(api_key, prompt)
-
-
-def friendly_api_error(provider: str, e: requests.HTTPError) -> str:
+def friendly_api_error(e: requests.HTTPError) -> str:
     status = e.response.status_code
     body = e.response.text[:300]
     if status == 503:
-        other = "ChatGPT" if provider == "Gemini (Google)" else "Gemini"
-        return (f"{provider} is temporarily overloaded (503) — Google/OpenAI's servers are at capacity right now. "
-                f"This usually clears within a minute or two. Try **Find Subcontractors** again, "
-                f"or switch to {other} using the provider toggle while you wait.")
+        return ("Gemini is temporarily overloaded (503) — Google's servers are at capacity right now. "
+                "This usually clears within a minute or two. The app already retried automatically; "
+                "please try **Find Subcontractors** again shortly.")
     if status == 429:
-        if provider == "ChatGPT (OpenAI)":
-            return ("OpenAI quota exceeded (429) — this API key has no remaining credit or hit its rate limit. "
-                    "Check billing at platform.openai.com/account/billing, or switch to Gemini using the provider selector.")
-        else:
-            return ("Gemini quota exceeded (429) — this API key hit its rate or usage limit. "
-                    "Check quota at aistudio.google.com, or switch to ChatGPT using the provider selector.")
+        return ("Gemini quota exceeded (429) — this API key hit its rate or usage limit. "
+                "Check quota and billing at aistudio.google.com, or ask your admin to update the key in Streamlit Secrets.")
     if status == 401 or status == 403:
-        return f"{provider} rejected this API key ({status}) — it may be invalid, revoked, or missing permissions."
+        return f"Gemini rejected this API key ({status}) — it may be invalid, revoked, or missing permissions."
     if status == 404:
-        return f"{provider} model not found (404) — the model name in the code may be outdated. Details: {body}"
-    return f"{provider} API error ({status}): {body}"
+        return f"Gemini model not found (404) — the model name in the code may be outdated. Details: {body}"
+    return f"Gemini API error ({status}): {body}"
 
 
 def build_ai_prompt(trade: str, region: str, specific_area: str, extra_notes: str, preferred_names: list) -> str:
@@ -657,7 +678,8 @@ For EACH company return a JSON object inside a ```json block with this EXACT sch
 }}
 
 Rules:
-- Use real UK Companies House registration numbers where known, else leave blank.
+- For registration_no: only provide a UK Companies House number if you are highly confident it is correct for this exact company. If you are not certain, leave it blank — a wrong number is worse than no number, since this app will flag and surface it to a procurement team.
+- For website: only provide a URL if you are highly confident it is the company's real site. Leave blank if unsure.
 - Trade scope should be 1-2 specific sentences about what they deliver relevant to this package.
 - Location should be the company's registered / main office address, including a UK postcode if you know it (helps map placement).
 - Proximity score: 10 = headquartered in or immediately adjacent to the target area; 1 = national but mobilisable.
@@ -687,34 +709,71 @@ def parse_ai_response(text: str):
 def companies_to_df(companies: list, db_df, supplier_df, trade: str, region: str) -> pd.DataFrame:
     rows = []
     for c in companies:
-        name = c.get("company_name", "")
-        reg  = c.get("registration_no", "")
+        ai_name = c.get("company_name", "")
+        ai_reg  = c.get("registration_no", "")
 
-        db_info = lookup_db(db_df, name, reg)
-        location = db_info.get("D&B Location") or c.get("location", "")
+        db_info  = lookup_db(db_df, ai_name, ai_reg)
+        pref     = find_preferred_match(supplier_df, trade, ai_name, ai_reg)
 
-        # Turnover: prefer D&B's official figure; fall back to the AI's estimate
+        is_verified = bool(db_info.get("_db_matched")) or bool(pref.get("is_preferred"))
+
+        # Verified data always wins over whatever the AI claimed. Preference
+        # order when both exist: preferred-supplier record, then D&B record,
+        # since the supplier list is your own curated/vetted data.
+        if pref.get("is_preferred"):
+            name = pref.get("company_name") or ai_name
+            reg  = pref.get("registration_no") or ai_reg
+            verified_location = pref.get("location", "")
+            verified_turnover = pref.get("turnover", "")
+            verified_risk     = pref.get("db_risk", "")
+        else:
+            name = ai_name
+            reg  = ai_reg
+            verified_location = ""
+            verified_turnover = ""
+            verified_risk     = ""
+
+        # D&B fills any gaps the preferred-supplier record didn't have
+        location = verified_location or db_info.get("D&B Location") or (ai_name and c.get("location", "")) or ""
+        db_risk  = verified_risk or db_info.get("D&B Risk", "")
+
+        # Turnover precedence: verified preferred-supplier figure > D&B figure
+        # > AI estimate (clearly flagged as such)
         db_turnover = db_info.get("Turnover", "")
         ai_turnover = c.get("estimated_turnover", None)
-        is_estimate = bool(c.get("turnover_is_estimate", False))
+        is_estimate = False
 
-        if db_turnover:
+        if verified_turnover:
+            turnover = verified_turnover
+            turnover_source = "Preferred Supplier List"
+        elif db_turnover:
             turnover = db_turnover
             turnover_source = "D&B"
         elif ai_turnover is not None:
             turnover = ai_turnover
-            turnover_source = "Estimated"
+            turnover_source = "Estimated (unverified)"
             is_estimate = True
         else:
             turnover = ""
             turnover_source = ""
 
-        pref = find_preferred_match(supplier_df, trade, name)
+        # Registration number is only shown if it came from a verified source —
+        # an AI-only registration number is too unreliable to present as fact.
+        if not (pref.get("registration_no") or db_info.get("_db_matched")):
+            reg_display = f"{ai_reg} (unverified)" if ai_reg else ""
+        else:
+            reg_display = reg
+
+        # Website was never in any source data — always AI-suggested, so it's
+        # labelled as such rather than presented as a verified fact.
+        ai_website = c.get("website", "")
+        website_display = f"{ai_website} (unverified — please confirm)" if ai_website else ""
+
         lat, lon = geocode_location(location)
 
         rows.append({
             "Company Name":      name,
-            "Registration No.":  reg,
+            "Registration No.":  reg_display,
             "Trade Scope":       c.get("trade_scope", ""),
             "Close to Area":     c.get("proximity_score", ""),
             "Location":          location,
@@ -722,11 +781,12 @@ def companies_to_df(companies: list, db_df, supplier_df, trade: str, region: str
             "Turnover Source":   turnover_source,
             "Company Size":      turnover_to_size_band(turnover),
             "Number of Employees": turnover_to_employee_estimate(turnover),
-            "D&B Risk":          db_info.get("D&B Risk", ""),
+            "D&B Risk":          db_risk,
             "Preferred Supplier": "Yes" if pref.get("is_preferred") else "",
             "Preferred Cluster": pref.get("cluster", "") if pref.get("is_preferred") else "",
-            "Website":           c.get("website", ""),
+            "Website":           website_display,
             "Notes":             c.get("notes", ""),
+            "_verified":         is_verified,
             "_db_matched":       bool(db_info.get("_db_matched")),
             "_turnover_is_estimate": is_estimate,
             "_lat": lat,
@@ -794,59 +854,13 @@ admin_supplier_df = get_admin_supplier_df()
 with st.sidebar:
     st.markdown("## 🔍 Search")
 
-    ai_provider = st.radio("AI Provider", ["ChatGPT (OpenAI)", "Gemini (Google)"], horizontal=True)
-    admin_api_key = get_admin_api_key(ai_provider)
-
-    if admin_api_key and admin_db_df is not None:
-        st.success("✅ Ready to search — no setup needed.")
-        api_key = admin_api_key
-        db_df = admin_db_df
-        st.caption(f"D&B database loaded: {len(db_df):,} records")
-    elif admin_api_key and admin_db_df is None:
-        st.warning("⚠️ D&B database not found in repo. Add `dnb_database.xlsx` — see Admin Setup below.")
-        api_key = admin_api_key
-        db_df = None
-    else:
-        st.warning(f"⚠️ No admin key configured for {ai_provider}. Enter one below for this session, or see Admin Setup at the bottom of the page.")
-        api_key = st.text_input(f"{ai_provider} API Key", type="password", placeholder="sk-..." if "OpenAI" in ai_provider else "AIza...")
-        db_df = admin_db_df
-        if db_df is None:
-            db_file = st.file_uploader("D&B Excel export (temporary, this session only)", type=["xlsx", "xls"])
-            db_df = load_excel_any(db_file) if db_file else None
-
-    # Work Package list — admin-provided, with session fallback
-    wp_df = admin_wp_df
-    if wp_df is None:
-        with st.expander("📋 Upload Work Package list", expanded=False):
-            st.caption("Upload your WP list to populate the Trade/Package dropdown with real package descriptions. Not configured by admin yet — see Admin Setup below.")
-            wp_file = st.file_uploader("Work Package Excel file", type=["xlsx", "xls"], key="wp_upload")
-            wp_df = load_wp_list(wp_file) if wp_file else None
-
-    # Preferred Supplier lists — admin-provided (multiple cluster files), with
-    # session fallback (multi-file upload, so several clusters can be combined)
+    # API key and all reference files loaded silently from repo/secrets.
+    # No status messages or upload widgets shown to users.
+    api_key     = get_admin_api_key()
+    db_df       = admin_db_df
+    wp_df       = admin_wp_df
     supplier_df = admin_supplier_df
-    if supplier_df is None:
-        with st.expander("⭐ Upload Preferred Supplier list(s)", expanded=False):
-            st.caption("Upload one or more cluster preferred-supplier exports — you can select multiple files at once. All are combined and used to prioritise known suppliers in results. Not configured by admin yet — see Admin Setup below.")
-            supplier_files = st.file_uploader(
-                "Preferred Supplier Excel file(s)",
-                type=["xlsx", "xls"],
-                key="supplier_upload",
-                accept_multiple_files=True,
-            )
-            if supplier_files:
-                frames = []
-                for f in supplier_files:
-                    d = load_preferred_suppliers(f)
-                    if d is not None and not d.empty:
-                        d["Cluster"] = os.path.splitext(f.name)[0]
-                        frames.append(d)
-                supplier_df = pd.concat(frames, ignore_index=True) if frames else None
-    if supplier_df is not None and not supplier_df.empty:
-        n_clusters = supplier_df["Cluster"].nunique() if "Cluster" in supplier_df.columns else 1
-        st.caption(f"⭐ {len(supplier_df):,} preferred suppliers loaded across {n_clusters} cluster file(s)")
 
-    st.markdown("---")
     st.markdown("### Trade & Area")
 
     if wp_df is not None and not wp_df.empty:
@@ -854,11 +868,11 @@ with st.sidebar:
     else:
         trade_options = ["— Select —"] + FALLBACK_TRADE_PACKAGES
 
-    trade_dropdown = st.selectbox("Trade / Package (from WP list)", trade_options)
-    trade_search = st.text_input("...or type a trade to search for", placeholder="e.g. acoustic ceilings, asphalt paving")
+    trade_dropdown = st.selectbox("Trade / Package", trade_options)
+    trade_search   = st.text_input("Or type a trade to search for", placeholder="e.g. acoustic ceilings, asphalt paving")
     trade = trade_search.strip() if trade_search.strip() else trade_dropdown
 
-    region = st.selectbox("UK Region / Area", ["— Select —"] + UK_REGIONS)
+    region        = st.selectbox("UK Region / Area", ["— Select —"] + UK_REGIONS)
     specific_area = st.text_input("Or a specific area (town, city, postcode)", placeholder="e.g. Reading, RG1, Maidstone")
 
     extra = st.text_area("Additional Notes", placeholder="e.g. CHAS accredited, min turnover £10M, experience in healthcare...", height=100)
@@ -879,14 +893,13 @@ st.markdown("""
 
 with st.expander("ℹ️ How to use this tool", expanded=False):
     st.markdown("""
-    1. **Choose an AI provider** (ChatGPT or Gemini) in the sidebar.
-    2. **Pick a Trade/Package** from the dropdown (populated from your Work Package list) — or just type a trade in the search box if it's not listed.
-    3. **Pick a UK Region**, or enter a specific town/city/postcode if you need a smaller area.
-    4. Add any extra notes (minimum turnover, accreditations, etc.), then click **Find Subcontractors**.
-    5. Results are cross-referenced against your D&B database and Preferred Supplier list, sorted by **Turnover → Company Size → Proximity**, with preferred suppliers prioritised to the top.
-    6. **Review the map** of supplier locations, **edit the table** inline, then **export to Excel**.
+    1. **Pick a Trade/Package** from the dropdown — or just type a trade in the search box.
+    2. **Pick a UK Region**, or enter a specific town/city/postcode for a smaller area.
+    3. Add any extra notes (minimum turnover, accreditations, etc.), then click **Find Subcontractors**.
+    4. Results are cross-referenced against D&B and Preferred Supplier data, sorted by **Preferred → Turnover → Company Size → Proximity**.
+    5. **Review the map**, **edit the table** inline, then **export to Excel**.
 
-    If you see a setup warning in the sidebar, the admin API key(s) and/or reference files haven't been configured yet for this deployment — see **Admin Setup** at the bottom of this page.
+    Only companies matched in the D&B or Preferred Supplier databases are verified. Anything else is AI-suggested and marked **"(unverified)"** — always confirm independently before contacting a supplier.
     """)
 
 if "result_df"   not in st.session_state: st.session_state.result_df   = None
@@ -901,7 +914,7 @@ if search_btn:
     elif region == "— Select —" and not specific_area.strip():
         st.warning("Please select a UK Region or enter a specific area before searching.")
     elif not api_key:
-        st.error(f"No {ai_provider} API key available. Ask your admin to configure one, or enter one in the sidebar.")
+        st.error("No Gemini API key available. Ask your admin to configure one, or enter one in the sidebar.")
     else:
         effective_region = specific_area.strip() if specific_area.strip() else region
         with st.spinner(f"Searching for {trade} subcontractors in {effective_region}…"):
@@ -917,7 +930,7 @@ if search_btn:
 
             prompt = build_ai_prompt(trade, region if region != "— Select —" else "", specific_area.strip(), extra, preferred_names)
             try:
-                raw = call_ai(ai_provider, api_key, prompt)
+                raw = call_gemini(api_key, prompt)
                 narrative, companies = parse_ai_response(raw)
                 df = companies_to_df(companies, db_df, supplier_df, trade, effective_region)
 
@@ -928,7 +941,7 @@ if search_btn:
                 st.session_state.raw_ai      = raw
 
             except requests.HTTPError as e:
-                st.error(friendly_api_error(ai_provider, e))
+                st.error(friendly_api_error(e))
             except Exception as e:
                 st.error(f"Error: {e}")
 
@@ -940,6 +953,7 @@ if st.session_state.result_df is not None:
     rgn  = st.session_state.last_region
 
     total      = len(df)
+    verified_cnt = int(df.get("_verified", pd.Series([False]*len(df))).sum()) if "_verified" in df.columns else 0
     with_db    = int(df.get("_db_matched", pd.Series([False]*len(df))).sum()) if "_db_matched" in df.columns else 0
     low_risk   = df["D&B Risk"].str.lower().str.contains("low", na=False).sum()
     local_cnt  = (pd.to_numeric(df["Close to Area"], errors="coerce") >= 7).sum()
@@ -948,18 +962,32 @@ if st.session_state.result_df is not None:
     st.markdown(f"""
     <div class="metric-row">
       <div class="metric-card"><div class="val">{total}</div><div class="lbl">Subcontractors Found</div></div>
+      <div class="metric-card"><div class="val">{verified_cnt}</div><div class="lbl">Verified (D&B or Preferred List)</div></div>
       <div class="metric-card"><div class="val">{preferred_cnt}</div><div class="lbl">Preferred Suppliers</div></div>
-      <div class="metric-card"><div class="val">{with_db}</div><div class="lbl">D&B Records Matched</div></div>
       <div class="metric-card"><div class="val">{low_risk}</div><div class="lbl">Low / Low-Mod Risk</div></div>
       <div class="metric-card"><div class="val">{local_cnt}</div><div class="lbl">Locally Based (Score ≥7)</div></div>
     </div>
     """, unsafe_allow_html=True)
 
+    unverified_cnt = total - verified_cnt
+    if unverified_cnt > 0:
+        st.warning(
+            f"⚠️ {unverified_cnt} of {total} companies are **not** in your D&B or Preferred Supplier data — "
+            f"their registration number, location, turnover and website are AI-suggested only and marked "
+            f"**'(unverified)'** in the table below. Please independently confirm these before contacting any supplier."
+        )
+
     if nav:
         st.markdown('<div class="section-title">📊 Market Overview</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="ai-box">{nav}</div>', unsafe_allow_html=True)
 
-    # ── Sort: Turnover (desc) -> Company Size band (desc) -> Close to Area (desc) ──
+    st.markdown('<div class="section-title">🔧 Filter & Export</div>', unsafe_allow_html=True)
+    risk_opts = ["All"] + sorted(df["D&B Risk"].dropna().unique().tolist())
+    risk_filt = st.selectbox("D&B Risk", risk_opts)
+
+    base = df if risk_filt == "All" else df[df["D&B Risk"] == risk_filt]
+
+    # ── Sort: Preferred first -> Turnover (desc) -> Company Size band (desc) -> Close to Area (desc) ──
     def _turnover_numeric(v):
         try:
             return float(str(v).replace(",", "").replace("£", "").strip())
@@ -968,7 +996,7 @@ if st.session_state.result_df is not None:
 
     size_rank = {label: i for i, (_, _, label) in enumerate(COMPANY_SIZE_BANDS)}
 
-    view = df.copy()
+    view = base.copy()
     view["_turn_sort"] = view["Turnover"].apply(_turnover_numeric)
     view["_size_sort"] = view["Company Size"].map(size_rank)
     view["_prox_sort"] = pd.to_numeric(view["Close to Area"], errors="coerce")
@@ -980,59 +1008,113 @@ if st.session_state.result_df is not None:
         na_position="last",
     ).drop(columns=["_turn_sort", "_size_sort", "_prox_sort", "_pref_sort"])
 
+    view = view.reset_index(drop=True)
+    view.insert(0, "#", view.index + 1)
+
     # ── Map of suggested suppliers ──────────────────────────────────────────────
     map_df = view.dropna(subset=["_lat", "_lon"]) if "_lat" in view.columns else pd.DataFrame()
     if not map_df.empty:
         st.markdown('<div class="section-title">🗺️ Supplier Locations</div>', unsafe_allow_html=True)
+        st.caption("Each numbered marker matches the **#** column in the table below. Bubble size reflects company turnover. Markers sitting on the same town are nudged apart slightly so they don't overlap.")
+
+        map_df = map_df.reset_index(drop=True)
+        map_df["_label"] = map_df["#"].astype(str)
+
+        # Spread out markers that geocoded to the exact same point (e.g. several
+        # companies in the same town), so they don't render as one indistinguishable blob.
+        import math
+        coord_counts = {}
+        jittered_lat, jittered_lon = [], []
+        for _, r in map_df.iterrows():
+            key = (round(r["_lat"], 3), round(r["_lon"], 3))
+            n = coord_counts.get(key, 0)
+            coord_counts[key] = n + 1
+            if n == 0:
+                jittered_lat.append(r["_lat"])
+                jittered_lon.append(r["_lon"])
+            else:
+                angle = (n - 1) * (2 * math.pi / 8)
+                radius = 0.035 * (1 + (n - 1) // 8)
+                jittered_lat.append(r["_lat"] + radius * math.sin(angle))
+                jittered_lon.append(r["_lon"] + radius * math.cos(angle))
+        map_df["_lat_j"] = jittered_lat
+        map_df["_lon_j"] = jittered_lon
 
         def _bubble_size(turnover):
             t = _turnover_numeric(turnover)
             if t is None or t <= 0:
-                return 14
-            import math
-            return max(14, min(60, 10 + 8 * math.log10(max(t, 1000))))
+                return 22
+            return max(22, min(56, 16 + 7 * math.log10(max(t, 1000))))
 
-        sizes = map_df["Turnover"].apply(_bubble_size)
-        colors = map_df["Preferred Supplier"].apply(lambda x: "#f57c00" if x == "Yes" else "#2563eb")
+        # A distinct, high-contrast colour per company, cycling through a
+        # qualitative palette so adjacent markers are visually separable —
+        # not just one blue blob and one orange blob.
+        palette = [
+            "#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c",
+            "#0891b2", "#db2777", "#65a30d", "#7c3aed", "#0d9488",
+            "#ca8a04", "#e11d48", "#4f46e5", "#059669", "#c2410c",
+        ]
+        marker_colors = [palette[i % len(palette)] for i in range(len(map_df))]
+        # Preferred suppliers get a gold ring via a distinct border-like outer
+        # marker drawn underneath (Scattermapbox has no native border width).
+        is_preferred = (map_df["Preferred Supplier"] == "Yes").tolist()
+
+        sizes = map_df["Turnover"].apply(_bubble_size).tolist()
         hover_text = map_df.apply(
-            lambda r: f"<b>{r['Company Name']}</b><br>Turnover: £{r['Turnover']}<br>{r['Location']}"
-            if r["Turnover"] else f"<b>{r['Company Name']}</b><br>{r['Location']}",
+            lambda r: (
+                f"<b>#{r['_label']} {r['Company Name']}</b><br>"
+                f"{'⭐ Preferred Supplier<br>' if r['Preferred Supplier'] == 'Yes' else ''}"
+                f"Turnover: £{r['Turnover']:,}" if isinstance(r['Turnover'], (int, float)) and r['Turnover']
+                else f"<b>#{r['_label']} {r['Company Name']}</b><br>{'⭐ Preferred Supplier<br>' if r['Preferred Supplier'] == 'Yes' else ''}{r['Location']}"
+            ) + f"<br>{r['Location']}",
             axis=1,
         )
 
-        fig = go.Figure(go.Scattermapbox(
-            lat=map_df["_lat"], lon=map_df["_lon"],
-            mode="markers",
-            marker=dict(size=sizes, color=colors, opacity=0.75),
-            text=hover_text,
+        fig = go.Figure()
+
+        # Gold halo behind preferred-supplier markers so they stand out beyond just colour
+        pref_idx = [i for i, p in enumerate(is_preferred) if p]
+        if pref_idx:
+            fig.add_trace(go.Scattermapbox(
+                lat=[map_df["_lat_j"].iloc[i] for i in pref_idx],
+                lon=[map_df["_lon_j"].iloc[i] for i in pref_idx],
+                mode="markers",
+                marker=dict(size=[sizes[i] + 14 for i in pref_idx], color="#fbbf24", opacity=0.55),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+
+        fig.add_trace(go.Scattermapbox(
+            lat=map_df["_lat_j"], lon=map_df["_lon_j"],
+            mode="markers+text",
+            marker=dict(size=sizes, color=marker_colors, opacity=0.9),
+            text=map_df["_label"],
+            textfont=dict(size=11, color="white"),
+            hovertext=hover_text,
             hoverinfo="text",
+            showlegend=False,
         ))
+
         fig.update_layout(
             mapbox=dict(style="open-street-map", zoom=6, center=dict(lat=float(map_df["_lat"].mean()), lon=float(map_df["_lon"].mean()))),
             margin=dict(l=0, r=0, t=0, b=0),
-            height=450,
+            height=480,
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("🔵 Standard supplier · 🟠 Preferred supplier · Bubble size reflects company turnover (bigger = larger company)")
+        st.caption("🟡 Gold halo = Preferred Supplier · Bubble size reflects turnover · Number on each marker matches the table's # column")
     else:
         st.info("📍 No locations could be mapped — locations need a recognisable UK postcode or town/city to plot.")
 
-    st.markdown('<div class="section-title">🔧 Filter & Export</div>', unsafe_allow_html=True)
-    risk_opts = ["All"] + sorted(df["D&B Risk"].dropna().unique().tolist())
-    risk_filt = st.selectbox("D&B Risk", risk_opts)
-
-    if risk_filt != "All":
-        view = view[view["D&B Risk"] == risk_filt]
-
     display_cols = [c for c in view.columns if not c.startswith("_")]
 
-    st.markdown(f"**{len(view)} companies shown**, sorted by Turnover → Company Size → Proximity — you can edit cells directly:")
+    st.markdown(f"**{len(view)} companies shown**, sorted by Preferred Supplier → Turnover → Company Size → Proximity — you can edit cells directly. Fields marked **'(unverified)'** were not found in your D&B or Preferred Supplier data and should be independently confirmed before use.")
     edited = st.data_editor(
         view[display_cols].reset_index(drop=True),
         use_container_width=True,
         num_rows="dynamic",
         column_config={
-            "Website":             st.column_config.LinkColumn("Website"),
+            "#":                   st.column_config.NumberColumn("#", width="small"),
+            "Website":             st.column_config.TextColumn("Website"),
             "Close to Area":       st.column_config.NumberColumn("Close to Area", min_value=1, max_value=10),
             "Trade Scope":         st.column_config.TextColumn("Trade Scope", width="large"),
             "Notes":               st.column_config.TextColumn("Notes", width="large"),
@@ -1066,43 +1148,5 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-# ── Admin setup instructions (always visible at bottom, collapsed) ───────────
-st.markdown("---")
-with st.expander("🛠️ Admin Setup (one-time, do this so users never need to upload anything)", expanded=False):
-    st.markdown("""
-    **Step 1 — Add your API keys as Streamlit secrets**
 
-    In Streamlit Cloud: open your app → **Settings → Secrets** → paste:
-    ```toml
-    OPENAI_API_KEY = "sk-your-openai-key-here"
-    GEMINI_API_KEY = "AIza-your-gemini-key-here"
-    ```
-    You can add either one or both — the provider selector in the sidebar will show "Ready to search" for whichever key is configured.
 
-    **Step 2 — Commit the reference files into the GitHub repo**
-
-    Place these files in the root of the repository, alongside `app.py`, using these exact names:
-
-    ```
-    your-repo/
-    ├── app.py
-    ├── requirements.txt
-    ├── dnb_database.xlsx              ← D&B (DNBi) risk/turnover export
-    ├── wp_list.xlsx                   ← Work Package list (trade/package descriptions)
-    ├── preferred_suppliers/           ← folder — add as many cluster files as you like
-    │   ├── cluster_1.xlsx
-    │   ├── cluster_2.xlsx
-    │   └── cluster_3.xlsx
-    └── README.md
-    ```
-
-    Every `.xlsx` file inside `preferred_suppliers/` is loaded and combined automatically — there's no limit on how many cluster files you add. Each company is tagged with which cluster file it came from (shown in the **Preferred Cluster** column in results). To add a new cluster later, just drop another file into that folder and push.
-
-    None of these files are required for the app to run — any missing piece simply falls back to a manual upload box for that session (the supplier uploader accepts multiple files at once too).
-
-    Once everything is in place, the sidebar will show **"✅ Ready to search"** and end users will only see the AI provider toggle and the trade/area search boxes.
-
-    **About API errors:**
-    - **429 "quota exceeded"** — the API key's billing/credit needs attention. Check platform.openai.com (OpenAI) or aistudio.google.com (Gemini), or switch providers using the toggle.
-    - **503 "overloaded"** — the provider's servers are temporarily at capacity. The app retries automatically; if it still fails, try again shortly or switch providers.
-    """)
