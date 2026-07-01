@@ -685,7 +685,7 @@ For EACH company return a JSON object inside a ```json block with this EXACT sch
       "trade_scope": "...",
       "location": "...",
       "website": "...",
-      "proximity_score": <integer 1-10 where 10 = based right in the area>,
+      "proximity_score": <integer 1-10 where 10 = headquartered right in the target area, 1 = national/remote>,
       "estimated_turnover": <number in GBP, or null if truly unknown>,
       "turnover_is_estimate": <true if this figure came from your own knowledge/web research rather than an official filing, false if it's a known/reported figure>,
       "notes": "..."
@@ -959,7 +959,7 @@ if st.session_state.result_df is not None:
     verified_cnt = int(df.get("_verified", pd.Series([False]*len(df))).sum()) if "_verified" in df.columns else 0
     with_db    = int(df.get("_db_matched", pd.Series([False]*len(df))).sum()) if "_db_matched" in df.columns else 0
     low_risk   = df["D&B Risk"].str.lower().str.contains("low", na=False).sum()
-    local_cnt  = (pd.to_numeric(df["Close to Area"], errors="coerce") >= 7).sum()
+    local_cnt  = (pd.to_numeric(df["Close to Area"], errors="coerce") <= 3).sum()
     preferred_cnt = (df["Preferred Supplier"] == "Yes").sum()
 
     st.markdown(f"""
@@ -968,7 +968,7 @@ if st.session_state.result_df is not None:
       <div class="metric-card"><div class="val">{verified_cnt}</div><div class="lbl">Verified (D&B or Preferred List)</div></div>
       <div class="metric-card"><div class="val">{preferred_cnt}</div><div class="lbl">Preferred Suppliers</div></div>
       <div class="metric-card"><div class="val">{low_risk}</div><div class="lbl">Low / Low-Mod Risk</div></div>
-      <div class="metric-card"><div class="val">{local_cnt}</div><div class="lbl">Locally Based (Score ≥7)</div></div>
+      <div class="metric-card"><div class="val">{local_cnt}</div><div class="lbl">Closest to Area (Rank ≤3)</div></div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -984,12 +984,6 @@ if st.session_state.result_df is not None:
         st.markdown('<div class="section-title">📊 Market Overview</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="ai-box">{nav}</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-title">🔧 Filter & Export</div>', unsafe_allow_html=True)
-    risk_opts = ["All"] + sorted(df["D&B Risk"].dropna().unique().tolist())
-    risk_filt = st.selectbox("D&B Risk", risk_opts)
-
-    base = df if risk_filt == "All" else df[df["D&B Risk"] == risk_filt]
-
     # ── Sort: Preferred first -> Turnover (desc) -> Company Size band (desc) -> Close to Area (desc) ──
     def _turnover_numeric(v):
         try:
@@ -999,7 +993,7 @@ if st.session_state.result_df is not None:
 
     size_rank = {label: i for i, (_, _, label) in enumerate(COMPANY_SIZE_BANDS)}
 
-    view = base.copy()
+    view = df.copy()
     view["_turn_sort"] = view["Turnover"].apply(_turnover_numeric)
     view["_size_sort"] = view["Company Size"].map(size_rank)
     view["_prox_sort"] = pd.to_numeric(view["Close to Area"], errors="coerce")
@@ -1009,7 +1003,15 @@ if st.session_state.result_df is not None:
         by=["_pref_sort", "_turn_sort", "_size_sort", "_prox_sort"],
         ascending=[False, False, False, False],
         na_position="last",
-    ).drop(columns=["_turn_sort", "_size_sort", "_prox_sort", "_pref_sort"])
+    ).drop(columns=["_turn_sort", "_size_sort", "_pref_sort"])
+
+    # Replace raw AI proximity score (1–10) with a simple rank across the
+    # actual result set: rank 1 = closest to the target area, rank N = furthest.
+    # Higher original score = closer, so rank by descending score.
+    view["Close to Area"] = view["_prox_sort"].rank(
+        ascending=False, method="min", na_option="bottom"
+    ).astype("Int64")
+    view = view.drop(columns=["_prox_sort"])
 
     view = view.reset_index(drop=True)
     view.insert(0, "#", view.index + 1)
@@ -1117,7 +1119,7 @@ if st.session_state.result_df is not None:
         num_rows="dynamic",
         column_config={
             "#":                     st.column_config.NumberColumn("#", width="small"),
-            "Close to Area":         st.column_config.NumberColumn("Close to Area", min_value=1, max_value=10),
+            "Close to Area":         st.column_config.NumberColumn("Close to Area (Rank)", help="1 = closest to target area, higher = further away"),
             "Trade Scope":           st.column_config.TextColumn("Trade Scope", width="large"),
             "Notes":                 st.column_config.TextColumn("Notes", width="large"),
             "Turnover":              st.column_config.NumberColumn("Turnover (£)", format="£%d"),
